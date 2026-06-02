@@ -1,2 +1,5 @@
 # Compiled binary (built with `go build -o ~/bin/ccmon .` or `go build .`)
 /ccmon
+
+# Local build output (`make build` / `make install`)
+/bin/
