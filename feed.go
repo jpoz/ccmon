@@ -22,6 +22,7 @@ type Event struct {
 	To    string // new state; "" means the pane closed
 	Msg   string // instance message at the moment of the transition
 	At    int64  // unix secs the transition is anchored to
+	born  int    // animation frame the event entered the feed; drives the flash fade
 }
 
 // instSnap is the minimal per-instance state we retain between polls to detect
@@ -63,6 +64,7 @@ const (
 func (m *model) appendEvent(e Event) {
 	m.feedSeq++
 	e.Seq = m.feedSeq
+	e.born = m.frame // anchors the flash fade to the animation clock
 	m.events = append(m.events, e)
 	if len(m.events) > maxFeedEvents {
 		m.events = m.events[len(m.events)-maxFeedEvents:]
@@ -204,28 +206,70 @@ func (m model) renderFeed(width, rows int) []string {
 	return lines
 }
 
+// flashRamp is the background a freshly-arrived event row pulses through as it
+// fades — a frost-blue highlight decaying through Nord greys to nothing, so a
+// new transition catches the eye then settles. flashStep frames per shade.
+var flashRamp = []lipgloss.Color{
+	lipgloss.Color("#5e81ac"), // nord10 frost-blue — the initial pulse
+	lipgloss.Color("#4c566a"), // nord3
+	lipgloss.Color("#434c5e"), // nord2
+	lipgloss.Color("#3b4252"), // nord1 — last breath before transparent
+}
+
+const flashStep = 2 // animation frames each ramp shade is held (≈250ms at 125ms/tick)
+
+// eventFlash returns the highlight background for an event that arrived within
+// the last flashRamp*flashStep frames, fading with age. ok is false once the
+// flash has decayed (the common case), leaving the row rendered normally.
+func (m model) eventFlash(e Event) (bg lipgloss.Color, ok bool) {
+	age := m.frame - e.born
+	if age < 0 || age >= len(flashRamp)*flashStep {
+		return "", false
+	}
+	return flashRamp[age/flashStep], true
+}
+
 // renderEvent formats one transition: "<age>  <label>  <from> → <to>  <msg>".
 // The destination state colors the arrow's target; a new session shows a green
-// "+", a closed pane a gray "✕ closed".
+// "+", a closed pane a gray "✕ closed". A just-arrived row pulses a fading
+// background across its full width (see eventFlash) so new activity stands out.
 func (m model) renderEvent(e Event, width int) string {
+	bg, flashing := m.eventFlash(e)
+	paint := func(c lipgloss.Color, s string) string {
+		st := lipgloss.NewStyle().Foreground(c)
+		if flashing {
+			st = st.Background(bg)
+		}
+		return st.Render(s)
+	}
+
 	age := padRight(dur(e.At), feedAgeW)
 	lbl := padRight(truncate(e.Label, feedLabelW), feedLabelW)
 
 	var plain, colored string
 	switch {
 	case e.To == "":
-		plain, colored = "✕ closed", fg(cGray, "✕ closed")
+		plain, colored = "✕ closed", paint(cGray, "✕ closed")
 	case e.From == "":
-		plain, colored = "+ "+e.To, fg(cGreen, "+ ")+fg(stateColor(e.To), e.To)
+		plain, colored = "+ "+e.To, paint(cGreen, "+ ")+paint(stateColor(e.To), e.To)
 	default:
-		plain, colored = e.From+" → "+e.To, fg(cDim, e.From+" → ")+fg(stateColor(e.To), e.To)
+		plain, colored = e.From+" → "+e.To, paint(cDim, e.From+" → ")+paint(stateColor(e.To), e.To)
 	}
 
-	out := "  " + fg(cDim, age+" ") + fg(cFg, lbl+" ") + colored
+	out := paint(cDim, "  "+age+" ") + paint(cFg, lbl+" ") + colored
 	used := 2 + feedAgeW + 1 + feedLabelW + 1 + lipgloss.Width(plain)
 	if e.Msg != "" {
 		if msgMax := width - used - 2; msgMax >= 6 {
-			out += fg(cDim, "  "+truncate(e.Msg, msgMax))
+			msg := truncate(e.Msg, msgMax)
+			out += paint(cDim, "  "+msg)
+			used += 2 + lipgloss.Width(msg)
+		}
+	}
+	// Extend the highlight across the rest of the row so the pulse reads as a
+	// full bar rather than just under the text.
+	if flashing {
+		if pad := width - used; pad > 0 {
+			out += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", pad))
 		}
 	}
 	return out

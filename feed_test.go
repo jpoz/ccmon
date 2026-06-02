@@ -135,6 +135,29 @@ func TestFeedScroll(t *testing.T) {
 	}
 }
 
+// A freshly-appended event flashes, the highlight fades with the animation
+// clock, and an old event doesn't flash at all.
+func TestEventFlash(t *testing.T) {
+	m := &model{frame: 100}
+	m.appendEvent(Event{To: StateDone}) // born = 100
+	e := m.events[0]
+
+	first, ok := m.eventFlash(e)
+	if !ok {
+		t.Fatal("a just-arrived event should flash")
+	}
+	// One ramp step later the shade should have advanced (faded).
+	m.frame = 100 + flashStep
+	if next, ok := m.eventFlash(e); !ok || next == first {
+		t.Fatalf("flash should fade to a new shade after %d frames", flashStep)
+	}
+	// Past the full ramp it stops flashing.
+	m.frame = 100 + len(flashRamp)*flashStep
+	if _, ok := m.eventFlash(e); ok {
+		t.Fatal("flash should have fully decayed")
+	}
+}
+
 func TestAppendEventCap(t *testing.T) {
 	m := &model{}
 	for range maxFeedEvents + 50 {

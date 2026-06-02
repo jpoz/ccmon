@@ -138,6 +138,10 @@ timestamp, and the message at the moment it changed. It turns the snapshot into
 a story: see what just finished or who went red while you were looking
 elsewhere.
 
+A new row **flashes** when it lands — a frost-blue highlight that fades through
+greys to nothing over about a second — so activity catches your eye and then
+settles, even if you weren't looking right at it.
+
 The panel is **responsive**: on a wide terminal it docks as a full-height column
 to the right of the table; on a narrow one it drops to a strip below it. Either
 way the table + feed are centered as a card so nothing smears edge-to-edge.
