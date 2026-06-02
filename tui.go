@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +21,14 @@ func gather() []*Instance {
 		if inst.PaneID != "" && !paneExists(inst.Socket, inst.PaneID) {
 			removeInstance(inst.ID) // pane closed → forget it
 			continue
+		}
+		// Self-heal: trust the live pane over possibly-stale hook state. This is
+		// what clears a session stuck on needs-input after you grant permission.
+		if changed, prev := reconcileClaude(inst); changed &&
+			inst.State == StateNeedsInput && prev != StateNeedsInput {
+			// A permission box is up that no hook told us about — alert as if the
+			// Notification hook had fired.
+			notify(inst, StateNeedsInput)
 		}
 		byKey[inst.Socket+"|"+inst.PaneID] = inst
 	}
@@ -66,8 +76,27 @@ func gather() []*Instance {
 
 type tickMsg struct{}
 
+// tickInterval drives both the spinner animation and (every framesPerGather
+// ticks) the data refresh. A sub-second tick keeps the "working" spinner
+// smooth without scanning tmux any more often than once a second.
+const (
+	tickInterval    = 125 * time.Millisecond
+	framesPerGather = 8 // 8 * 125ms ≈ 1s between gathers
+)
+
 func tick() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+	return tea.Tick(tickInterval, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+// nagInterval is how often a still-red (needs-input) session is re-notified
+// while the TUI is running. Override with CCMON_NAG_SECS.
+func nagInterval() int64 {
+	if v := os.Getenv("CCMON_NAG_SECS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return int64(n)
+		}
+	}
+	return 60
 }
 
 type model struct {
@@ -75,18 +104,52 @@ type model struct {
 	cur    int
 	w, h   int
 	status string
+	frame  int              // animation frame counter (bumped every tick)
+	nag    map[string]int64 // instance id -> unix secs of last notification
 }
 
 func (m model) Init() tea.Cmd { return tick() }
+
+// checkNags re-fires a reminder for every session that's been stuck in
+// needs-input for another nagInterval. The Since timestamp anchors the first
+// reminder one interval after the session went red (the hook already sent the
+// initial banner). Entries are dropped once a session leaves needs-input or its
+// pane disappears, so nagging stops the moment you attend to it.
+func (m model) checkNags() {
+	present := map[string]bool{}
+	for _, r := range m.rows {
+		present[r.ID] = true
+		if r.State != StateNeedsInput {
+			delete(m.nag, r.ID)
+			continue
+		}
+		if _, seen := m.nag[r.ID]; !seen {
+			m.nag[r.ID] = r.Since
+		}
+		if now()-m.nag[r.ID] >= nagInterval() {
+			renotify(r)
+			m.nag[r.ID] = now()
+		}
+	}
+	for id := range m.nag {
+		if !present[id] {
+			delete(m.nag, id)
+		}
+	}
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case tickMsg:
-		m.rows = gather()
-		if m.cur >= len(m.rows) {
-			m.cur = max(0, len(m.rows)-1)
+		m.frame++
+		if m.frame%framesPerGather == 0 {
+			m.rows = gather()
+			m.checkNags()
+			if m.cur >= len(m.rows) {
+				m.cur = max(0, len(m.rows)-1)
+			}
 		}
 		return m, tick()
 	case tea.KeyMsg:
@@ -115,12 +178,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.rows = gather()
 			}
-		case "c": // acknowledge: clear the alert
+		case "c": // acknowledge: clear the alert + dismiss its banner
 			if m.cur < len(m.rows) {
 				inst := m.rows[m.cur]
 				inst.setState(StateIdle)
 				_ = inst.save()
 				tagPane(inst)
+				clearNotification(inst.ID)
+				delete(m.nag, inst.ID)
 				m.rows = gather()
 			}
 		case "x": // forget this instance
@@ -144,13 +209,14 @@ var (
 	cGray   = lipgloss.Color("#6c7689")
 	cFg     = lipgloss.Color("#eceff4")
 	cDim    = lipgloss.Color("#8893a5")
+	cAccent = lipgloss.Color("#88c0d0") // frost blue: title + selection cursor
 	cSelBg  = lipgloss.Color("#434c5e")
 	cBarBg  = lipgloss.Color("#3b4252")
-
-	headStyle = lipgloss.NewStyle().Bold(true).Foreground(cFg).Background(cBarBg).Padding(0, 1)
-	footStyle = lipgloss.NewStyle().Foreground(cDim).Padding(0, 1)
-	selStyle  = lipgloss.NewStyle().Background(cSelBg).Bold(true)
 )
+
+// spinFrames is a monochrome braille spinner used for the working state. It's
+// just text, so it colors like any other glyph (no emoji).
+var spinFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func stateColor(s string) lipgloss.Color {
 	switch s {
@@ -165,26 +231,37 @@ func stateColor(s string) lipgloss.Color {
 	}
 }
 
-func stateIcon(s string) string {
+// glyph returns a single monochrome cell for a state (colored by the caller).
+// Filled vs hollow distinguishes active from idle even without color, and
+// "working" animates so a live session reads as alive rather than just yellow.
+func (m model) glyph(s string) string {
 	switch s {
 	case StateNeedsInput:
-		return "🔴"
+		return "●"
 	case StateDone:
-		return "🟢"
+		return "●"
 	case StateWorking:
-		return "🟡"
+		return spinFrames[(m.frame/2)%len(spinFrames)]
 	default:
-		return "⚪"
+		return "○"
 	}
+}
+
+// fg paints s with a foreground color and nothing else.
+func fg(c lipgloss.Color, s string) string {
+	return lipgloss.NewStyle().Foreground(c).Render(s)
+}
+
+// onBar paints s with the header/footer bar background so adjacent segments
+// keep the bar filled even across the ANSI resets between colored runs.
+func onBar(c lipgloss.Color, bold bool, s string) string {
+	return lipgloss.NewStyle().Background(cBarBg).Foreground(c).Bold(bold).Render(s)
 }
 
 func label(i *Instance) string { return i.Source + ":" + i.Project }
 
 func dur(since int64) string {
-	d := now() - since
-	if d < 0 {
-		d = 0
-	}
+	d := max(now()-since, 0)
 	switch {
 	case d < 60:
 		return fmt.Sprintf("%ds", d)
@@ -195,56 +272,142 @@ func dur(since int64) string {
 	}
 }
 
+// column widths for the body table; the column header lines up with these.
+const (
+	colTool = 6
+	colProj = 16
+	colAge  = 7
+
+	// maxContentWidth caps how wide the panel grows. Past this the table stops
+	// stretching and gets centered, so it reads as a card on a big monitor
+	// instead of smearing edge-to-edge; narrower terminals still use full width.
+	maxContentWidth = 100
+)
+
 func (m model) View() string {
+	termW := m.w
+	if termW == 0 {
+		termW = 100
+	}
+	height := m.h
+	if height == 0 {
+		height = 24
+	}
+
+	// Responsive: full width when the terminal is narrow, a horizontally
+	// centered card once it's wider than the panel needs.
+	width := min(termW, maxContentWidth)
+	indent := strings.Repeat(" ", max((termW-width)/2, 0))
+
 	var counts [4]int
 	for _, r := range m.rows {
 		counts[statePriority(r.State)]++
 	}
-	head := headStyle.Render(fmt.Sprintf(
-		" CC MISSION CONTROL   🔴 %d need input   🟢 %d done   🟡 %d working   ⚪ %d idle ",
-		counts[0], counts[1], counts[2], counts[3]))
 
-	var b strings.Builder
-	b.WriteString(head + "\n\n")
+	// ---- header bar (spans full width) ----
+	title := onBar(cAccent, true, " ▎ CC MISSION CONTROL ")
+	summary := onBar(cRed, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d need   ", counts[0])) +
+		onBar(cGreen, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d done   ", counts[1])) +
+		onBar(cYellow, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d working   ", counts[2])) +
+		onBar(cGray, false, "○ ") + onBar(cFg, false, fmt.Sprintf("%d idle ", counts[3]))
+	gap := max(width-lipgloss.Width(title)-lipgloss.Width(summary), 1)
+	header := title + onBar(cFg, false, strings.Repeat(" ", gap)) + summary
 
+	// ---- column header ----
+	colHead := fg(cDim, "    "+padRight("TOOL", colTool+1)+
+		padRight("PROJECT", colProj+1)+padRight("AGE", colAge+1)+"MESSAGE")
+
+	// ---- body rows ----
+	var body []string
 	if len(m.rows) == 0 {
-		b.WriteString(footStyle.Render("  no claude/codex instances detected\n"))
+		body = append(body, "", fg(cDim,
+			"    no claude or codex instances detected — start one and it'll show up here"))
+	} else {
+		// Keep the footer pinned to the bottom: if there are more rows than
+		// fit, show what we can and surface the dropped count (never silently).
+		maxRows := max(height-5, 1) // header, blank, col-header, blank, footer
+		rows, overflow := m.rows, 0
+		if len(rows) > maxRows {
+			overflow = len(rows) - (maxRows - 1)
+			rows = rows[:maxRows-1]
+		}
+		for idx, r := range rows {
+			body = append(body, m.renderRow(idx, r, width))
+		}
+		if overflow > 0 {
+			body = append(body, fg(cDim, fmt.Sprintf("    … and %d more", overflow)))
+		}
 	}
 
-	width := m.w
-	if width == 0 {
-		width = 100
-	}
-	for idx, r := range m.rows {
-		marker := "  "
-		if idx == m.cur {
-			marker = "▌ "
-		}
-		tool := strings.ToUpper(r.Source[:1]) + r.Source[1:]
-		inferred := ""
-		if r.inferred {
-			inferred = " ~"
-		}
-		row := stateIcon(r.State) + marker +
-			padRight(tool, 5) + " " +
-			padRight(truncate(r.Project, 12), 12) + " " +
-			padRight(dur(r.Since), 8) + " " +
-			truncate(r.Msg, max(10, width-42)) + inferred
-		if idx == m.cur {
-			row = selStyle.Render(padRight(row, width-1))
-		} else {
-			row = lipgloss.NewStyle().Foreground(stateColor(r.State)).Render(row)
-		}
-		b.WriteString(row + "\n")
-	}
-
-	b.WriteString("\n")
-	foot := "↑/↓ move · enter jump · c ack · x forget · r refresh · q quit"
+	// ---- footer bar (spans full width) ----
+	keys := "↑/↓ move · enter jump · c ack · x forget · r refresh · q quit"
+	var footer string
 	if m.status != "" {
-		foot = m.status + "   " + foot
+		footer = onBar(cAccent, true, " "+m.status+"  ") + onBar(cDim, false, keys+" ")
+	} else {
+		footer = onBar(cDim, false, " "+keys+" ")
 	}
-	b.WriteString(footStyle.Render(foot))
+	if fgap := width - lipgloss.Width(footer); fgap > 0 {
+		footer += onBar(cDim, false, strings.Repeat(" ", fgap))
+	}
+
+	// ---- assemble, indenting to center and padding the middle so the
+	// footer sits at the bottom ----
+	var b strings.Builder
+	b.WriteString(indent + header + "\n\n")
+	b.WriteString(indent + colHead + "\n")
+	for _, line := range body {
+		b.WriteString(indent + line + "\n")
+	}
+	if fill := height - 4 - len(body); fill > 0 {
+		b.WriteString(strings.Repeat("\n", fill))
+	}
+	b.WriteString(indent + footer)
 	return b.String()
+}
+
+// renderRow formats one instance as a single padded line. The state glyph is
+// always tinted with the state color; on the selected row everything sits on a
+// highlight background (each segment carries that background so the bar fills
+// cleanly across the ANSI resets between colored runs).
+func (m model) renderRow(idx int, r *Instance, width int) string {
+	sel := idx == m.cur
+	sc := stateColor(r.State)
+	glyph := m.glyph(r.State)
+	tool := padRight(titleCase(r.Source), colTool)
+	proj := padRight(truncate(r.Project, colProj), colProj)
+	age := padRight(dur(r.Since), colAge)
+
+	meta := "" // inferred (scan-discovered, no event yet) gets a subtle marker
+	if r.inferred {
+		meta = " ~"
+	}
+	fixed := 2 + 1 + 1 + colTool + 1 + colProj + 1 + colAge + 1
+	msgMax := max(width-fixed-1-len([]rune(meta)), 8)
+	msg := truncate(r.Msg, msgMax)
+
+	if sel {
+		seg := func(c lipgloss.Color, bold bool, s string) string {
+			return lipgloss.NewStyle().Background(cSelBg).Foreground(c).Bold(bold).Render(s)
+		}
+		line := seg(cAccent, false, "▌ ") + seg(sc, false, glyph+" ") +
+			seg(cFg, true, tool+" ") + seg(cFg, true, proj+" ") +
+			seg(cDim, false, age+" ") + seg(cFg, false, msg) + seg(cDim, false, meta)
+		used := 2 + 2 + colTool + 1 + colProj + 1 + colAge + 1 + len([]rune(msg)) + len([]rune(meta))
+		if pad := width - used; pad > 0 {
+			line += lipgloss.NewStyle().Background(cSelBg).Render(strings.Repeat(" ", pad))
+		}
+		return line
+	}
+	return "  " + fg(sc, glyph+" ") + fg(cDim, tool+" ") + fg(cFg, proj+" ") +
+		fg(cDim, age+" ") + fg(cDim, msg) + fg(cDim, meta)
+}
+
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func padRight(s string, n int) string {
@@ -256,7 +419,7 @@ func padRight(s string, n int) string {
 }
 
 func runTUI() {
-	p := tea.NewProgram(model{rows: gather()}, tea.WithAltScreen())
+	p := tea.NewProgram(model{rows: gather(), nag: map[string]int64{}}, tea.WithAltScreen())
 	_, _ = p.Run()
 }
 

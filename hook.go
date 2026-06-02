@@ -49,7 +49,19 @@ func runHook() {
 		inst.Session, inst.Window, inst.WinName = sess, win, winName
 	}
 
-	notifyKind := ""
+	notifyKind := applyClaudeEvent(inst, p)
+
+	_ = inst.save()
+	tagPane(inst) // best-effort tmux marker for status bars
+	if notifyKind != "" {
+		notify(inst, notifyKind)
+	}
+}
+
+// applyClaudeEvent transitions inst according to a single hook event and reports
+// which kind of notification (if any) the transition should raise. It is pure
+// (no I/O) so the state machine can be unit-tested directly.
+func applyClaudeEvent(inst *Instance, p claudePayload) (notifyKind string) {
 	switch p.HookEventName {
 	case "SessionStart":
 		inst.setState(StateIdle)
@@ -64,6 +76,13 @@ func runHook() {
 			inst.Msg = p.Message
 		}
 		notifyKind = StateNeedsInput
+	case "PreToolUse", "PostToolUse":
+		// A tool is starting or finishing ⇒ Claude is not blocked on you. This
+		// is the key signal that clears a stale needs-input the moment a tool
+		// runs after you grant permission — Claude fires no dedicated
+		// "permission granted" event, so without this the session would stay
+		// red until the whole turn ended.
+		inst.setState(StateWorking)
 	case "Stop":
 		inst.setState(StateDone)
 		notifyKind = StateDone
@@ -74,12 +93,7 @@ func runHook() {
 	default:
 		inst.setState(StateWorking)
 	}
-
-	_ = inst.save()
-	tagPane(inst) // best-effort tmux marker for status bars
-	if notifyKind != "" {
-		notify(inst, notifyKind)
-	}
+	return notifyKind
 }
 
 // codexPayload is the JSON the codex CLI passes to its `notify` program.

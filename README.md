@@ -25,27 +25,58 @@ tmux directly for jumping.
 
 ## State model
 
-| state         | set by                          | notifies |
-|---------------|---------------------------------|----------|
-| `idle`        | SessionStart                    | no       |
-| `working`     | UserPromptSubmit / SubagentStop | no       |
-| `needs-input` | Notification                    | **yes**  |
-| `done`        | Stop / codex turn-complete      | **yes**  |
+State is detected two ways that back each other up:
+
+**1. Hooks (low-latency, push):**
+
+| state         | set by                                            | notifies |
+|---------------|---------------------------------------------------|----------|
+| `idle`        | SessionStart                                      | no       |
+| `working`     | UserPromptSubmit / Pre/PostToolUse / SubagentStop | no       |
+| `needs-input` | Notification                                      | **yes**  |
+| `done`        | Stop / codex turn-complete                        | **yes**  |
+
+`PostToolUse` is the important one: Claude fires **no** event when you *grant*
+permission, so a tool actually running again is the signal that you've unblocked
+it. Without that hook a session stayed stuck on `needs-input` until the whole
+turn ended.
+
+**2. Pane reconciliation (self-healing, pull):** every TUI poll, each Claude
+pane is captured (`tmux capture-pane`) and classified directly from what's on
+screen — a permission box (`Do you want to proceed?` + `❯ 1. Yes`) ⇒
+`needs-input`, a live spinner (`Germinating… (4m 44s · ↓ 18.1k tokens)`) ⇒
+`working`, a completed line (`✻ Cooked for 1m 39s` / `※ recap:`) ⇒ `done`. The
+pane is ground truth for whether Claude is blocked on you, so this corrects any
+hook that was missed, delayed, or never fired. `classifyClaudePane` in `pane.go`
+is a pure function; `reconcileClaude` applies it.
 
 State lives in `~/.ccmon/state/<id>.json`, one file per instance.
 Each pane is also tagged with a `@cc_state` tmux user option for status bars.
 
-- **Claude** instances report rich state via hooks (keyed by session id).
+- **Claude** instances report rich state via hooks (keyed by session id), then
+  get reconciled against their live pane.
 - **Codex** instances report `done` via the `notify` program, and are also
   auto-discovered by scanning tmux even before their first event (state inferred
   from pane activity; shown with a `~` marker).
 
 Instances are pruned automatically when their pane closes.
 
+## Tests
+
+    go test ./...            # unit + tmux integration
+    go test -short ./...     # unit only (skips the live-tmux test)
+
+- `pane_test.go` — table-driven classification of real `capture-pane` fixtures
+  (working / done / idle / permission / resumed-after-grant).
+- `hook_test.go` — the hook state machine, incl. `needs-input → PostToolUse → working`.
+- `reconcile_integration_test.go` — paints fixtures into a throwaway tmux pane
+  and asserts `reconcileClaude` reads the live pane and corrects stale state.
+
 ## Wiring (already installed)
 
 - `~/.claude/settings.json` → `hooks` for SessionStart, UserPromptSubmit,
-  Notification, Stop, SubagentStop, SessionEnd all call `ccmon hook`.
+  Notification, **PreToolUse, PostToolUse,** Stop, SubagentStop, SessionEnd all
+  call `ccmon hook`.
 - `~/.codex/config.toml` → `notify = ["/Users/jpoz/bin/ccmon", "codex-hook"]`.
 - Binary installed at `~/bin/ccmon`.
 
@@ -57,3 +88,22 @@ Instances are pruned automatically when their pane closes.
 
 `↑/↓` or `j/k` move · `Enter` jump to pane · `c` acknowledge (clear alert) ·
 `x` forget instance · `r` refresh · `q` quit
+
+## Re-notifications (nagging)
+
+While the TUI is running it acts as the watcher: any session stuck in
+`needs-input` (red) is re-notified every 60s ("⏰ still waiting · Nm") until you
+attend to it. Nagging stops the moment the session leaves `needs-input` —
+because you jumped to it (`Enter`), acked it (`c`), or it got your input. Each
+reminder removes the previous banner first so it reliably re-alerts instead of
+silently updating. Only red sessions nag; `done` is informational.
+
+If the TUI isn't running you still get the single initial banner from the hook —
+the repeating reminders just need the TUI up (e.g. in a dashboard pane).
+
+## Environment variables
+
+| var               | default | effect                                              |
+|-------------------|---------|-----------------------------------------------------|
+| `CCMON_NAG_SECS`  | `60`    | seconds between re-notifications of a red session   |
+| `CCMON_DEBUG`     | unset   | append every notification to `~/.ccmon/notify.log`  |

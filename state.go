@@ -134,8 +134,14 @@ func sortInstances(xs []*Instance) {
 }
 
 // setState transitions, resetting Since only when the state actually changes.
+// Leaving needs-input drops the message too: the "needs your permission" /
+// "waiting for your input" text is only meaningful while blocked, and a caller
+// with something fresher to say sets it right after.
 func (i *Instance) setState(s string) {
 	if i.State != s {
+		if i.State == StateNeedsInput {
+			i.Msg = ""
+		}
 		i.State = s
 		i.Since = now()
 	}

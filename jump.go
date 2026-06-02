@@ -28,6 +28,7 @@ func jumpTo(i *Instance) error {
 	i.setState(StateWorking)
 	_ = i.save()
 	tagPane(i)
+	clearNotification(i.ID) // attended → drop any lingering banner
 	// Bring the terminal forward (the click came from a background banner).
 	_ = exec.Command("open", "-a", "Ghostty").Start()
 	return nil
