@@ -23,9 +23,18 @@ func jumpTo(i *Instance) error {
 	}
 	_, _ = tmux(i.Socket, "select-window", "-t", i.PaneID)
 	_, _ = tmux(i.Socket, "select-pane", "-t", i.PaneID)
-	// Clearing the alert state here means clicking through to a pane marks it
-	// as attended, so it drops out of the "needs me" group.
-	i.setState(StateWorking)
+	// Jumping to a pane means you've seen it, so it drops out of the "needs me"
+	// groups. A finished turn becomes idle but keeps its summary message — the
+	// work is done and you've read it, yet what it said is still worth a glance;
+	// Attended stops the reconciler re-deriving "done" from the completed-turn
+	// line still on the pane. Anything else (a live or blocked session) reads as
+	// working until the next event/reconcile says otherwise.
+	if i.State == StateDone {
+		i.setState(StateIdle)
+		i.Attended = true
+	} else {
+		i.setState(StateWorking)
+	}
 	_ = i.save()
 	tagPane(i)
 	clearNotification(i.ID) // attended → drop any lingering banner

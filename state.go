@@ -35,6 +35,12 @@ type Instance struct {
 	WinName string `json:"win_name"` // window name
 	PaneID  string `json:"pane_id"`  // e.g. %15
 
+	// Attended marks a finished turn the user has already jumped to (or acked):
+	// it's demoted to idle but keeps its message, and the pane reconciler stops
+	// re-deriving "done" from the completed-turn line that lingers on screen.
+	// Any genuinely new activity clears it (see setState).
+	Attended bool `json:"attended"`
+
 	// inferred is true for codex panes discovered by scanning (no real event yet).
 	inferred bool
 }
@@ -142,6 +148,9 @@ func (i *Instance) setState(s string) {
 		if i.State == StateNeedsInput {
 			i.Msg = ""
 		}
+		// A real transition supersedes a jump/ack demotion: jumpTo re-marks it
+		// right after if the new state is the idle it just demoted to.
+		i.Attended = false
 		i.State = s
 		i.Since = now()
 	}

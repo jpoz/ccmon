@@ -1,5 +1,8 @@
 // ccmon — mission control for Claude Code & Codex instances running in tmux.
 //
+//	ccmon install      wire ccmon into Claude Code + Codex (idempotent)
+//	ccmon uninstall    remove ccmon's hooks / notify wiring
+//	ccmon doctor       report install status + dependency health
 //	ccmon hook         called by Claude Code hooks (JSON on stdin)
 //	ccmon codex-hook   called by codex `notify` (JSON in argv)
 //	ccmon jump <id>    focus the instance's tmux pane + Ghostty
@@ -18,6 +21,12 @@ func main() {
 		return
 	}
 	switch os.Args[1] {
+	case "install":
+		runInstall(os.Args[2:])
+	case "uninstall":
+		runUninstall(os.Args[2:])
+	case "doctor":
+		runDoctor()
 	case "hook":
 		runHook()
 	case "codex-hook":
@@ -29,7 +38,7 @@ func main() {
 	case "list":
 		runList()
 	default:
-		fmt.Fprintln(os.Stderr, "usage: ccmon [hook|codex-hook|jump <id>|tui|list]")
+		fmt.Fprintln(os.Stderr, "usage: ccmon [install|uninstall|doctor|hook|codex-hook|jump <id>|tui|list]")
 		os.Exit(2)
 	}
 }

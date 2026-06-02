@@ -40,10 +40,14 @@ func gather() []*Instance {
 		if ex, ok := byKey[key]; ok {
 			// Codex emits no "started" event, so infer renewed activity from
 			// tmux: output newer than the last known state means it's working
-			// again. (Claude reports its own state, so leave it alone.)
-			if ex.Source == "codex" && ex.State == StateDone && p.activity > ex.Since+3 {
+			// again. This also revives a codex pane the user attended (idle) —
+			// without it, a jumped-to codex would sit idle through its next turn
+			// until completion. (Claude reports its own state, so leave it alone.)
+			if ex.Source == "codex" && p.activity > ex.Since+3 &&
+				(ex.State == StateDone || (ex.State == StateIdle && ex.Attended)) {
 				ex.State = StateWorking
 				ex.Since = p.activity
+				ex.Attended = false
 			}
 			continue // already have a richer, event-backed record
 		}
@@ -104,8 +108,13 @@ type model struct {
 	cur    int
 	w, h   int
 	status string
-	frame  int              // animation frame counter (bumped every tick)
-	nag    map[string]int64 // instance id -> unix secs of last notification
+	frame  int                 // animation frame counter (bumped every tick)
+	nag    map[string]int64    // instance id -> unix secs of last notification
+	events        []Event             // activity feed, oldest first (see feed.go)
+	prev          map[string]instSnap // last-seen state per instance, for diffing
+	feed          bool                // whether the activity-feed panel is shown
+	feedSeq       int64               // monotonic event id counter
+	feedBottomSeq int64               // anchored bottom event when scrolled; 0 = follow tail
 }
 
 func (m model) Init() tea.Cmd { return tick() }
@@ -145,11 +154,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.frame++
 		if m.frame%framesPerGather == 0 {
-			m.rows = gather()
+			m.refresh()
 			m.checkNags()
-			if m.cur >= len(m.rows) {
-				m.cur = max(0, len(m.rows)-1)
-			}
 		}
 		return m, tick()
 	case tea.KeyMsg:
@@ -176,25 +182,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.status = "→ " + label(inst)
 				}
-				m.rows = gather()
+				m.refresh()
 			}
 		case "c": // acknowledge: clear the alert + dismiss its banner
 			if m.cur < len(m.rows) {
 				inst := m.rows[m.cur]
 				inst.setState(StateIdle)
+				inst.Attended = true // seen → don't let reconcile re-green it
 				_ = inst.save()
 				tagPane(inst)
 				clearNotification(inst.ID)
 				delete(m.nag, inst.ID)
-				m.rows = gather()
+				m.refresh()
 			}
 		case "x": // forget this instance
 			if m.cur < len(m.rows) {
 				removeInstance(m.rows[m.cur].ID)
-				m.rows = gather()
+				m.refresh()
 			}
+		case "f": // toggle the activity-feed panel
+			m.feed = !m.feed
+			m.feedBottomSeq = 0 // (re)open streaming live
+		case "pgup", "ctrl+u": // scroll the feed toward older events
+			m.scrollFeed(-1)
+		case "pgdown", "ctrl+d": // scroll back toward the live tail
+			m.scrollFeed(1)
 		case "r":
-			m.rows = gather()
+			m.refresh()
 		}
 	}
 	return m, nil
@@ -285,62 +299,106 @@ const (
 )
 
 func (m model) View() string {
-	termW := m.w
+	termW, termH := m.w, m.h
 	if termW == 0 {
 		termW = 100
 	}
-	height := m.h
-	if height == 0 {
-		height = 24
+	if termH == 0 {
+		termH = 24
 	}
+	if side, tableW, feedW, rows := m.feedLayout(); m.feed && side {
+		return m.viewSide(termW, tableW, feedW, rows)
+	}
+	return m.viewStacked(termW, termH)
+}
 
-	// Responsive: full width when the terminal is narrow, a horizontally
-	// centered card once it's wider than the panel needs.
+// viewStacked is the default layout: a horizontally centered card with the
+// table on top and — when the feed is open and the terminal is too narrow for a
+// side column — a feed strip pinned above the footer.
+func (m model) viewStacked(termW, termH int) string {
 	width := min(termW, maxContentWidth)
 	indent := strings.Repeat(" ", max((termW-width)/2, 0))
 
+	var feedLines []string
+	if m.feed {
+		feedLines = m.renderFeed(width, feedMaxLines)
+	}
+	// Keep the footer pinned: reserve header, blank, col-header, blank, footer
+	// (5 lines) plus the feed strip; the table gets what's left.
+	body := m.renderBody(width, max(termH-5-len(feedLines), 1))
+
+	var b strings.Builder
+	b.WriteString(indent + m.headerBar(width) + "\n\n")
+	b.WriteString(indent + colHeadLine() + "\n")
+	for _, line := range body {
+		b.WriteString(indent + line + "\n")
+	}
+	if fill := termH - 4 - len(body) - len(feedLines); fill > 0 {
+		b.WriteString(strings.Repeat("\n", fill))
+	}
+	for _, line := range feedLines {
+		b.WriteString(indent + line + "\n")
+	}
+	b.WriteString(indent + m.footerBar(width))
+	return b.String()
+}
+
+// viewSide puts the feed in a full-height column on the right, with the table on
+// the left. The header and footer bars span both columns, and the whole pair is
+// centered as a card so it doesn't smear edge-to-edge on a wide monitor.
+func (m model) viewSide(termW, tableW, feedW, feedRows int) string {
+	cardW := tableW + sideGutter + feedW
+	indent := strings.Repeat(" ", max((termW-cardW)/2, 0))
+	// Both columns fill the region between the header (2 lines) and footer (1).
+	// The feed's title and the table's column header each take one of those rows,
+	// so the table gets feedRows data rows just like the feed gets feedRows events.
+	regionH := feedRows + 1
+
+	// Left column: column header + table rows, padded to the region height.
+	left := append([]string{colHeadLine()}, m.renderBody(tableW, feedRows)...)
+	// Right column: the feed panel, filling the same height.
+	right := m.renderFeed(feedW, feedRows)
+
+	gutter := strings.Repeat(" ", sideGutter)
+	var mid strings.Builder
+	for i := range regionH {
+		var l, r string
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		if pad := tableW - lipgloss.Width(l); pad > 0 {
+			l += strings.Repeat(" ", pad)
+		}
+		mid.WriteString(indent + l + gutter + r + "\n")
+	}
+	return indent + m.headerBar(cardW) + "\n\n" + mid.String() + indent + m.footerBar(cardW)
+}
+
+// headerBar renders the full-width title + state-count summary.
+func (m model) headerBar(width int) string {
 	var counts [4]int
 	for _, r := range m.rows {
 		counts[statePriority(r.State)]++
 	}
-
-	// ---- header bar (spans full width) ----
 	title := onBar(cAccent, true, " ▎ CC MISSION CONTROL ")
 	summary := onBar(cRed, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d need   ", counts[0])) +
 		onBar(cGreen, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d done   ", counts[1])) +
 		onBar(cYellow, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d working   ", counts[2])) +
 		onBar(cGray, false, "○ ") + onBar(cFg, false, fmt.Sprintf("%d idle ", counts[3]))
 	gap := max(width-lipgloss.Width(title)-lipgloss.Width(summary), 1)
-	header := title + onBar(cFg, false, strings.Repeat(" ", gap)) + summary
+	return title + onBar(cFg, false, strings.Repeat(" ", gap)) + summary
+}
 
-	// ---- column header ----
-	colHead := fg(cDim, "    "+padRight("TOOL", colTool+1)+
-		padRight("PROJECT", colProj+1)+padRight("AGE", colAge+1)+"MESSAGE")
-
-	// ---- body rows ----
-	var body []string
-	if len(m.rows) == 0 {
-		body = append(body, "", fg(cDim,
-			"    no claude or codex instances detected — start one and it'll show up here"))
-	} else {
-		// Keep the footer pinned to the bottom: if there are more rows than
-		// fit, show what we can and surface the dropped count (never silently).
-		maxRows := max(height-5, 1) // header, blank, col-header, blank, footer
-		rows, overflow := m.rows, 0
-		if len(rows) > maxRows {
-			overflow = len(rows) - (maxRows - 1)
-			rows = rows[:maxRows-1]
-		}
-		for idx, r := range rows {
-			body = append(body, m.renderRow(idx, r, width))
-		}
-		if overflow > 0 {
-			body = append(body, fg(cDim, fmt.Sprintf("    … and %d more", overflow)))
-		}
+// footerBar renders the full-width key hints (with the current status, if any).
+// The hint set swaps to surface feed scrolling while the feed is open.
+func (m model) footerBar(width int) string {
+	keys := "↑/↓ move · enter jump · c ack · x forget · f feed · r refresh · q quit"
+	if m.feed {
+		keys = "↑/↓ move · enter jump · c ack · f feed · PgUp/PgDn scroll · q quit"
 	}
-
-	// ---- footer bar (spans full width) ----
-	keys := "↑/↓ move · enter jump · c ack · x forget · r refresh · q quit"
 	var footer string
 	if m.status != "" {
 		footer = onBar(cAccent, true, " "+m.status+"  ") + onBar(cDim, false, keys+" ")
@@ -350,20 +408,36 @@ func (m model) View() string {
 	if fgap := width - lipgloss.Width(footer); fgap > 0 {
 		footer += onBar(cDim, false, strings.Repeat(" ", fgap))
 	}
+	return footer
+}
 
-	// ---- assemble, indenting to center and padding the middle so the
-	// footer sits at the bottom ----
-	var b strings.Builder
-	b.WriteString(indent + header + "\n\n")
-	b.WriteString(indent + colHead + "\n")
-	for _, line := range body {
-		b.WriteString(indent + line + "\n")
+// colHeadLine is the dim table column header.
+func colHeadLine() string {
+	return fg(cDim, "    "+padRight("TOOL", colTool+1)+
+		padRight("PROJECT", colProj+1)+padRight("AGE", colAge+1)+"MESSAGE")
+}
+
+// renderBody formats the table rows for a column `width` wide, limited to
+// `maxRows`; if there are more instances than fit it surfaces the dropped count
+// rather than silently truncating.
+func (m model) renderBody(width, maxRows int) []string {
+	if len(m.rows) == 0 {
+		return []string{"", fg(cDim,
+			"    no claude or codex instances detected — start one and it'll show up here")}
 	}
-	if fill := height - 4 - len(body); fill > 0 {
-		b.WriteString(strings.Repeat("\n", fill))
+	rows, overflow := m.rows, 0
+	if len(rows) > maxRows {
+		overflow = len(rows) - (maxRows - 1)
+		rows = rows[:maxRows-1]
 	}
-	b.WriteString(indent + footer)
-	return b.String()
+	body := make([]string, 0, len(rows)+1)
+	for idx, r := range rows {
+		body = append(body, m.renderRow(idx, r, width))
+	}
+	if overflow > 0 {
+		body = append(body, fg(cDim, fmt.Sprintf("    … and %d more", overflow)))
+	}
+	return body
 }
 
 // renderRow formats one instance as a single padded line. The state glyph is
@@ -419,7 +493,9 @@ func padRight(s string, n int) string {
 }
 
 func runTUI() {
-	p := tea.NewProgram(model{rows: gather(), nag: map[string]int64{}}, tea.WithAltScreen())
+	rows := gather()
+	m := model{rows: rows, nag: map[string]int64{}, prev: seedSnaps(rows)}
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, _ = p.Run()
 }
 

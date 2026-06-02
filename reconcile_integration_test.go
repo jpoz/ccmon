@@ -84,6 +84,38 @@ func TestReconcileScrubsStaleMsg(t *testing.T) {
 	}
 }
 
+// TestReconcileKeepsAttendedDoneIdle covers jumping to a finished session: the
+// completed-turn line is still on the pane (classifier reads "done"), but once
+// the user has attended it the row must stay idle and keep its message instead
+// of bouncing back to green.
+func TestReconcileKeepsAttendedDoneIdle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping tmux integration test in -short mode")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	t.Setenv("HOME", t.TempDir())
+	sock := filepath.Join(t.TempDir(), "ccmon-attended.sock")
+	t.Cleanup(func() { _, _ = tmux(sock, "kill-server") })
+
+	pane := paintPane(t, sock, paneDone)
+	inst := &Instance{
+		ID: "attended", Source: "claude", Socket: sock, PaneID: pane,
+		State: StateIdle, Attended: true, Msg: "shipped the refactor", Since: now(),
+	}
+	changed, _ := reconcileClaude(inst)
+	if changed {
+		t.Errorf("changed = true, want false (attended done stays idle)")
+	}
+	if inst.State != StateIdle {
+		t.Errorf("state = %q, want %q (attended done must not re-green)", inst.State, StateIdle)
+	}
+	if inst.Msg != "shipped the refactor" {
+		t.Errorf("Msg = %q, want it preserved", inst.Msg)
+	}
+}
+
 // paintPane creates a pane that displays the given text and stays alive, then
 // returns its pane id once the content has actually rendered.
 func paintPane(t *testing.T, sock, text string) string {

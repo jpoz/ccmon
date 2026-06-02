@@ -1,4 +1,4 @@
-module ccmon
+module github.com/jpoz/ccmon
 
 go 1.26.3
 

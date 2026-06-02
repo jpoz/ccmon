@@ -13,10 +13,47 @@ sessions were silently dropped (the "flaky push"). ccmon instead talks to
 `terminal-notifier` directly, which doesn't care about tmux forwarding, and to
 tmux directly for jumping.
 
+## Install
+
+ccmon is macOS-only and needs `tmux` and `terminal-notifier`:
+
+    brew install tmux terminal-notifier
+
+Install the binary, then wire it into Claude Code and Codex:
+
+    go install github.com/jpoz/ccmon@latest   # → ~/go/bin/ccmon (keep ~/go/bin on $PATH)
+    ccmon install
+
+`ccmon install` is idempotent — safe to re-run after upgrading or moving the
+binary. It:
+
+- adds `ccmon hook` to `~/.claude/settings.json` for every relevant event
+  (SessionStart, UserPromptSubmit, Notification, PreToolUse, PostToolUse, Stop,
+  SubagentStop, SessionEnd), **preserving any hooks you already have**;
+- sets `notify = ["…/ccmon", "codex-hook"]` in `~/.codex/config.toml` — only if
+  `~/.codex` exists, and never clobbering a `notify` program you already use;
+- backs up each file it touches to `<file>.bak`.
+
+Then **restart any running Claude Code / Codex sessions** so they pick up the
+hooks. To verify, undo, or check dependencies:
+
+    ccmon doctor      # report wiring + dependency health
+    ccmon uninstall   # remove ccmon's hooks / notify (leaves the rest intact)
+
+Prefer not to use `go install`? Build from source — any dir on your `$PATH`
+works, the installer wires whatever path the binary lives at:
+
+    git clone https://github.com/jpoz/ccmon && cd ccmon
+    go build -o ~/bin/ccmon .
+    ~/bin/ccmon install
+
 ## Commands
 
 | command            | who calls it                          | what it does                                  |
 |--------------------|---------------------------------------|-----------------------------------------------|
+| `ccmon install`    | you (once, to set up)                 | wire ccmon into Claude Code + Codex hooks     |
+| `ccmon uninstall`  | you                                   | remove ccmon's hook / notify wiring           |
+| `ccmon doctor`     | you / debugging                       | report install status + dependency health     |
 | `ccmon hook`       | Claude Code hooks (JSON on stdin)     | update state, notify on needs-input / done    |
 | `ccmon codex-hook` | codex `notify` (JSON in argv)         | update state, notify on turn-complete         |
 | `ccmon jump <id>`  | notification click / TUI Return       | select the pane + `open -a Ghostty`           |
@@ -72,22 +109,49 @@ Instances are pruned automatically when their pane closes.
 - `reconcile_integration_test.go` — paints fixtures into a throwaway tmux pane
   and asserts `reconcileClaude` reads the live pane and corrects stale state.
 
-## Wiring (already installed)
+## Wiring (managed by `ccmon install`)
 
-- `~/.claude/settings.json` → `hooks` for SessionStart, UserPromptSubmit,
-  Notification, **PreToolUse, PostToolUse,** Stop, SubagentStop, SessionEnd all
-  call `ccmon hook`.
-- `~/.codex/config.toml` → `notify = ["/Users/jpoz/bin/ccmon", "codex-hook"]`.
-- Binary installed at `~/bin/ccmon`.
+You don't edit these by hand — `ccmon install` writes them and `ccmon uninstall`
+removes them — but for reference, the wiring is:
+
+- `~/.claude/settings.json` → a `hooks` entry calling `ccmon hook` for
+  SessionStart, UserPromptSubmit, Notification, **PreToolUse, PostToolUse,**
+  Stop, SubagentStop, and SessionEnd.
+- `~/.codex/config.toml` → `notify = ["<path-to>/ccmon", "codex-hook"]`.
 
 ## Build
 
-    go build -o ~/bin/ccmon .
+    go build -o ~/bin/ccmon .   # or: go install github.com/jpoz/ccmon@latest
 
 ## TUI keys
 
 `↑/↓` or `j/k` move · `Enter` jump to pane · `c` acknowledge (clear alert) ·
-`x` forget instance · `r` refresh · `q` quit
+`x` forget instance · `f` toggle activity feed · `PgUp/PgDn` (or `Ctrl-U/Ctrl-D`)
+scroll the feed · `r` refresh · `q` quit
+
+## Activity feed
+
+`f` toggles a live feed that streams state transitions as they happen —
+`working → done`, `idle → needs-input`, a green `+` when a session appears,
+`✕ closed` when its pane goes away — each with the project, a relative
+timestamp, and the message at the moment it changed. It turns the snapshot into
+a story: see what just finished or who went red while you were looking
+elsewhere.
+
+The panel is **responsive**: on a wide terminal it docks as a full-height column
+to the right of the table; on a narrow one it drops to a strip below it. Either
+way the table + feed are centered as a card so nothing smears edge-to-edge.
+
+`PgUp`/`PgDn` (or `Ctrl-U`/`Ctrl-D`) scroll back through history. Scrolling is
+**sequence-anchored**, so new events streaming in while you read don't lurch the
+view; a `↑N`/`↓N PgDn=live` marker on the panel's title shows how much is off
+screen, and scrolling back to the bottom re-engages live-follow.
+
+It's derived purely by diffing successive polls (`recordEvents` in `feed.go`),
+so it captures everything the TUI observes — hook-driven changes, pane
+reconciliation, codex activity, and your own ack/jump — with no extra hook
+wiring. The buffer is in-memory and ephemeral: it shows activity since you
+opened the TUI, and seeds silently so already-running sessions don't flood it.
 
 ## Re-notifications (nagging)
 

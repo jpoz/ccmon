@@ -130,6 +130,16 @@ func reconcileClaude(inst *Instance) (changed bool, prev string) {
 		return false, prev
 	}
 
+	// A finished turn the user already attended (jumped to / acked) stays idle.
+	// Its completed-turn line lingers on the pane until they type, so the
+	// classifier keeps reading "done" — honour the demotion and keep the row
+	// idle (and its message) rather than re-greening it. A spinner or permission
+	// box is genuinely new activity: leave it untouched so setState clears
+	// Attended and the row comes alive again.
+	if inst.Attended && live == StateDone {
+		live = StateIdle
+	}
+
 	dirty := false
 	switch {
 	case live != inst.State:
