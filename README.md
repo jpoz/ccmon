@@ -59,6 +59,7 @@ works, the installer wires whatever path the binary lives at:
 | `ccmon jump <id>`  | notification click / TUI Return       | select the pane + `open -a Ghostty`           |
 | `ccmon tui`        | you (`ccmon` with no args = tui)      | live router; arrow + Return to jump           |
 | `ccmon list`       | you / debugging                       | plain-text dump of current state              |
+| `ccmon test-notification` | you / debugging                | fire one notification by hand (`--osc` / `--plain` / `--done` / `--nag`) |
 
 ## State model
 
@@ -127,7 +128,46 @@ removes them — but for reference, the wiring is:
 
 `↑/↓` or `j/k` move · `Enter` jump to pane · `c` acknowledge (clear alert) ·
 `x` forget instance · `f` toggle activity feed · `PgUp/PgDn` (or `Ctrl-U/Ctrl-D`)
-scroll the feed · `r` refresh · `q` quit
+scroll the feed · `m` mute/unmute sounds · `n` switch notify backend ·
+`r` refresh · `q` quit
+
+## Notification sounds & mute
+
+Each notification kind plays a configurable macOS alert sound, overridable by env
+var (set in your shell profile, then **restart Claude/Codex sessions** so the
+hooks inherit it; `none`/`off` mutes a kind):
+
+| kind          | env var             | default  |
+|---------------|---------------------|----------|
+| needs-input   | `CCMON_SOUND_NEEDS` | `Bottle` |
+| done          | `CCMON_SOUND_DONE`  | `Blow`   |
+| still-waiting | `CCMON_SOUND_NAG`   | `Submarine` |
+
+Audition any of them without touching config:
+
+    ccmon test-notification          # needs-input sound
+    ccmon test-notification --done   # done sound
+    ccmon test-notification --nag    # nag sound
+
+`m` in the TUI mutes/unmutes all notification **sounds** (banners still show); the
+header shows `⊘ MUTED` while active. It writes `~/.ccmon/muted`, which the hook
+processes read too, so the mute applies everywhere — not just the TUI.
+
+## Notification backend (terminal-notifier vs OSC-777)
+
+`terminal-notifier` is the default and the reliable one — it delivers regardless
+of tmux attach state. `n` in the TUI flips to **OSC-777** (the escape-sequence
+path described in *Why*) for the rest of us who want to try it: ccmon writes the
+`OSC 777 ; notify` sequence to the target pane's tty, wrapped in tmux passthrough.
+The header shows an `OSC-777` tag while active, and the choice persists in
+`~/.ccmon/notify-backend` so the hooks honor it live (no restart needed).
+
+Caveats of OSC-777: it only reaches you when the target pane is in the *attached*
+client, your terminal must support it (Ghostty does), and tmux needs
+`set -g allow-passthrough on`. Sounds are the terminal's call, not ccmon's, so the
+per-kind sounds and mute don't apply (muting just drops OSC notifications). Test it:
+
+    ccmon test-notification --osc        # also --done / --nag
 
 ## Activity feed
 

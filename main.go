@@ -8,6 +8,7 @@
 //	ccmon jump <id>    focus the instance's tmux pane + Ghostty
 //	ccmon tui          interactive router (default with no args)
 //	ccmon list         plain-text dump of current state
+//	ccmon test-notification [--osc] [--plain] [--done|--nag]   fire one by hand to debug delivery
 package main
 
 import (
@@ -37,8 +38,10 @@ func main() {
 		runTUI()
 	case "list":
 		runList()
+	case "test-notification":
+		runTestNotification(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: ccmon [install|uninstall|doctor|hook|codex-hook|jump <id>|tui|list]")
+		fmt.Fprintln(os.Stderr, "usage: ccmon [install|uninstall|doctor|hook|codex-hook|jump <id>|tui|list|test-notification]")
 		os.Exit(2)
 	}
 }

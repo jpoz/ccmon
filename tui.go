@@ -115,6 +115,8 @@ type model struct {
 	feed          bool                // whether the activity-feed panel is shown
 	feedSeq       int64               // monotonic event id counter
 	feedBottomSeq int64               // anchored bottom event when scrolled; 0 = follow tail
+	muted         bool                // notification sounds silenced (mirrors the ~/.ccmon/muted flag)
+	backend       string              // notification backend (mirrors ~/.ccmon/notify-backend)
 }
 
 func (m model) Init() tea.Cmd { return tick() }
@@ -200,6 +202,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				removeInstance(m.rows[m.cur].ID)
 				m.refresh()
 			}
+		case "m": // toggle mute: silence notification sounds (banners still show)
+			m.muted = !m.muted
+			_ = setMuted(m.muted)
+			if m.muted {
+				m.status = "muted — sounds off"
+			} else {
+				m.status = "unmuted"
+			}
+		case "n": // toggle notification backend: terminal-notifier ↔ OSC-777
+			if m.backend == backendOSC777 {
+				m.backend = backendTerminalNotifier
+			} else {
+				m.backend = backendOSC777
+			}
+			_ = setNotifyBackend(m.backend)
+			m.status = "notify via " + backendLabel(m.backend)
 		case "f": // toggle the activity-feed panel
 			m.feed = !m.feed
 			m.feedBottomSeq = 0 // (re)open streaming live
@@ -384,7 +402,14 @@ func (m model) headerBar(width int) string {
 		counts[statePriority(r.State)]++
 	}
 	title := onBar(cAccent, true, " ▎ CC MISSION CONTROL ")
-	summary := onBar(cRed, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d need   ", counts[0])) +
+	summary := ""
+	if m.backend == backendOSC777 {
+		summary += onBar(cAccent, true, "OSC-777  ")
+	}
+	if m.muted {
+		summary += onBar(cYellow, true, "⊘ MUTED  ")
+	}
+	summary += onBar(cRed, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d need   ", counts[0])) +
 		onBar(cGreen, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d done   ", counts[1])) +
 		onBar(cYellow, false, "● ") + onBar(cFg, false, fmt.Sprintf("%d working   ", counts[2])) +
 		onBar(cGray, false, "○ ") + onBar(cFg, false, fmt.Sprintf("%d idle ", counts[3]))
@@ -395,9 +420,17 @@ func (m model) headerBar(width int) string {
 // footerBar renders the full-width key hints (with the current status, if any).
 // The hint set swaps to surface feed scrolling while the feed is open.
 func (m model) footerBar(width int) string {
-	keys := "↑/↓ move · enter jump · c ack · x forget · f feed · r refresh · q quit"
+	mute := "m mute"
+	if m.muted {
+		mute = "m unmute"
+	}
+	backend := "n osc-777" // pressing n switches to the other backend
+	if m.backend == backendOSC777 {
+		backend = "n notifier"
+	}
+	keys := "↑/↓ move · enter jump · c ack · x forget · f feed · " + mute + " · " + backend + " · q quit"
 	if m.feed {
-		keys = "↑/↓ move · enter jump · c ack · f feed · PgUp/PgDn scroll · q quit"
+		keys = "↑/↓ move · enter jump · c ack · f feed · scroll PgUp/PgDn · " + mute + " · " + backend + " · q quit"
 	}
 	var footer string
 	if m.status != "" {
@@ -494,7 +527,7 @@ func padRight(s string, n int) string {
 
 func runTUI() {
 	rows := gather()
-	m := model{rows: rows, nag: map[string]int64{}, prev: seedSnaps(rows)}
+	m := model{rows: rows, nag: map[string]int64{}, prev: seedSnaps(rows), muted: isMuted(), backend: notifyBackend()}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, _ = p.Run()
 }
