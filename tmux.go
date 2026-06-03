@@ -95,12 +95,18 @@ func scanPanes() []paneInfo {
 }
 
 // paneExists reports whether a pane id still exists on a socket.
+//
+// We can't trust display-message's exit code alone: tmux resolves an unknown
+// "%N" target leniently (falling back to a default pane) and exits 0 with the
+// format rendered against that fallback — so a dead pane id looks alive. Asking
+// for "#{pane_id}" and requiring it to echo back the id we asked about closes
+// that gap; a missing pane yields empty (or a different id) and we report gone.
 func paneExists(socket, paneID string) bool {
 	if paneID == "" {
 		return false
 	}
-	_, err := tmux(socket, "display-message", "-p", "-t", paneID, "#{pane_id}")
-	return err == nil
+	out, err := tmux(socket, "display-message", "-p", "-t", paneID, "#{pane_id}")
+	return err == nil && out == paneID
 }
 
 func isCodexCommand(cmd string) bool {
