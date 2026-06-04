@@ -5,20 +5,22 @@ import (
 	"strings"
 )
 
-// This file infers a Claude instance's state directly from what its tmux pane is
-// *showing*, independent of hooks. The pane is ground truth for whether Claude is
-// blocked on you: a permission box is on screen or it isn't; the work spinner is
-// running or it isn't. Hooks are great for low-latency notifications but can be
-// missed, delayed, or simply absent for a transition (Claude fires no event when
-// you grant permission), which is what leaves a session stuck on needs-input.
+// This file infers an instance's state directly from what its tmux pane is
+// *showing*, independent of hooks. The pane is ground truth for whether the
+// agent is blocked on you: a permission box is on screen or it isn't; the work
+// spinner is running or it isn't. Hooks are great for low-latency notifications
+// but can be missed, delayed, or simply absent for a transition (Claude fires no
+// event when you grant permission; codex fires nothing at all until a turn
+// ends), which is what leaves a session stuck on needs-input — or working.
 // Reconciling persisted state against the live pane self-heals all of those.
 
 var (
 	// The confirmation box always offers a numbered "Yes" choice (the first one
-	// is pre-selected with ❯) and asks whether to proceed / make the edit / etc.
-	// Leading run tolerates indentation, the ❯ cursor, and box borders (│).
-	rePermYes = regexp.MustCompile(`(?m)^[\s│❯>]*1\.\s+Yes`)
-	rePermNo  = regexp.MustCompile(`(?m)^[\s│❯>]*\d\.\s+No[,.]`)
+	// is pre-selected with ❯, or › in codex) and asks whether to proceed / make
+	// the edit / etc. Leading run tolerates indentation, the cursor, and box
+	// borders (│).
+	rePermYes = regexp.MustCompile(`(?m)^[\s│❯›>]*1\.\s+Yes`)
+	rePermNo  = regexp.MustCompile(`(?m)^[\s│❯›>]*\d\.\s+No[,.]`)
 
 	// The live spinner renders the verb with a trailing "…" and a running
 	// "(<elapsed> · ↓ N tokens · …)" parenthetical, e.g. "Germinating… (4m 44s".
@@ -33,6 +35,15 @@ var (
 	// Markers that the pane is a Claude UI at all (so we don't override hook
 	// state for a pane that's actually showing a shell or an exited process).
 	reClaudeChrome = regexp.MustCompile(`auto mode|\(1M context\)|esc to interrupt|Claude Code|▐▛███▜▌|⏵⏵`)
+
+	// Codex's long-turn completion separator, "─ Worked for 1m 13s ─────…".
+	// Short turns end with a bare separator instead, which is indistinguishable
+	// from an idle composer — see classifyCodexPane.
+	reCodexCompleted = regexp.MustCompile(`(?m)^\s*─+ Worked for [^─\n]+─`)
+
+	// Markers that the pane is a codex UI at all: the startup banner and the
+	// status footer ("gpt-5.5 xhigh fast · ~/dir · Context 83% left · …").
+	reCodexChrome = regexp.MustCompile(`OpenAI Codex \(v|Context \d+% left|/model to change`)
 )
 
 func hasPermissionPrompt(text string) bool {
@@ -99,6 +110,27 @@ func classifyClaudePane(text string) (state string, ok bool) {
 	return "", false
 }
 
+// classifyCodexPane derives a state from a codex pane's visible content. Unlike
+// Claude's, ok=false doesn't just mean "not a codex UI": a short-turn completion
+// renders a bare separator and the composer, which is pixel-identical to sitting
+// idle — so chrome with no marker is "nothing definitive" and the caller keeps
+// (or quiesces, see reconcileCodex) the hook-reported state. While a turn runs
+// codex shows "• Working (14s • esc to interrupt)"; approval boxes (trust a
+// directory, run a command) use the same numbered-Yes shape as Claude's
+// permission prompt; long turns end with the "─ Worked for <dur> ─" separator.
+func classifyCodexPane(text string) (state string, ok bool) {
+	region := liveRegion(text)
+	switch {
+	case hasActiveSpinner(region):
+		return StateWorking, true
+	case hasPermissionPrompt(region):
+		return StateNeedsInput, true
+	case reCodexCompleted.MatchString(region):
+		return StateDone, true
+	}
+	return "", false
+}
+
 // capturePane returns the visible (no-scrollback) content of a pane.
 func capturePane(socket, paneID string) (string, bool) {
 	if paneID == "" {
@@ -129,7 +161,50 @@ func reconcileClaude(inst *Instance) (changed bool, prev string) {
 	if !ok {
 		return false, prev
 	}
+	return applyLiveState(inst, live), prev
+}
 
+// codexQuietSecs guards the stale-working demotion in reconcileCodex. A working
+// codex re-renders its "(14s • esc to interrupt)" elapsed timer every second,
+// which bumps window_activity in near-real-time — so a pane that's been quiet
+// this long while claiming "working" can't actually be working.
+const codexQuietSecs = 5
+
+// reconcileCodex corrects a codex instance's persisted state to match its pane,
+// mirroring reconcileClaude. It matters more here: codex emits exactly one hook
+// event per turn (the completion notify), so a wrong "working" — a missed
+// notify, or a jump that promoted it — has no later event to fix it, and an
+// approval box mid-turn raises no event at all. activity is the pane's
+// window_activity from the scan ( 0 = unknown).
+func reconcileCodex(inst *Instance, activity int64) (changed bool, prev string) {
+	prev = inst.State
+	if inst.Source != "codex" || inst.PaneID == "" {
+		return false, prev
+	}
+	text, ok := capturePane(inst.Socket, inst.PaneID)
+	if !ok {
+		return false, prev
+	}
+	live, ok := classifyCodexPane(text)
+	if !ok {
+		// Nothing definitive on screen. The only stored state worth overriding
+		// is a stale "working": demote it once the pane has been quiet past any
+		// mid-turn render blink (a real turn redraws every second). Keep Msg —
+		// the last completion summary is still worth showing on the idle row.
+		if inst.State != StateWorking || !reCodexChrome.MatchString(text) ||
+			activity <= 0 || now()-activity <= codexQuietSecs {
+			return false, prev
+		}
+		live = StateIdle
+	}
+	return applyLiveState(inst, live), prev
+}
+
+// applyLiveState folds a pane-derived state into the instance: honours the
+// attended-done demotion, transitions or scrubs a stale blocked message, and
+// persists + re-tags the pane when anything changed. Shared tail of the
+// per-source reconcilers.
+func applyLiveState(inst *Instance, live string) (changed bool) {
 	// A finished turn the user already attended (jumped to / acked) stays idle.
 	// Its completed-turn line lingers on the pane until they type, so the
 	// classifier keeps reading "done" — honour the demotion and keep the row
@@ -159,7 +234,7 @@ func reconcileClaude(inst *Instance) (changed bool, prev string) {
 		_ = inst.save()
 		tagPane(inst)
 	}
-	return changed, prev
+	return changed
 }
 
 // isStalePermissionMsg reports whether a message only makes sense while a

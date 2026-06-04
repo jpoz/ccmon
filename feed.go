@@ -8,11 +8,12 @@ import (
 )
 
 // The activity feed turns the snapshot into a story: a scrolling log of state
-// transitions across every instance. It's derived purely by diffing successive
-// gather() results against the previous snapshot, so it captures everything the
-// TUI observes — hook-driven changes, pane reconciliation, codex activity bumps,
-// and your own ack/jump — without any new hook plumbing. The buffer is in-memory
-// and ephemeral: it shows what's happened since you opened the TUI.
+// transitions across every instance, newest at the top. The live view is derived
+// by diffing successive gather() results against the previous snapshot, so it
+// captures everything the TUI observes — hook-driven changes, pane reconciliation
+// (both Claude and codex), and your own ack/jump. For durability the hooks also
+// persist each transition to ~/.ccmon/feed.jsonl (see feedlog.go), and the TUI
+// seeds itself with the last 24h on open so the panel isn't blank on launch.
 
 // Event is one observed state transition for an instance.
 type Event struct {
@@ -49,7 +50,7 @@ func seedSnaps(rows []*Instance) map[string]instSnap {
 
 const (
 	maxFeedEvents = 200 // ring-buffer cap; older events scroll off the top
-	feedMaxLines  = 6    // event rows shown in the bottom (stacked) panel
+	feedMaxLines  = 6   // event rows shown in the bottom (stacked) panel
 	feedAgeW      = 5
 	feedLabelW    = 18
 
@@ -73,25 +74,34 @@ func (m *model) appendEvent(e Event) {
 
 // recordEvents diffs the freshly gathered rows against the previous snapshot,
 // appending an event for each appearance, state change, and disappearance, then
-// updates the snapshot.
-func (m *model) recordEvents(rows []*Instance) {
+// updates the snapshot. It returns the events it emitted so refresh can persist
+// them; recordEvents itself stays free of disk I/O to keep the diffing logic
+// unit-testable. Closes and codex tmux-inference reach the durable log only
+// through here — no hook observes them (see feedlog.go).
+func (m *model) recordEvents(rows []*Instance) []Event {
+	var emitted []Event
+	add := func(e Event) {
+		m.appendEvent(e)
+		emitted = append(emitted, e)
+	}
 	seen := make(map[string]bool, len(rows))
 	for _, r := range rows {
 		seen[r.ID] = true
 		switch snap, ok := m.prev[r.ID]; {
 		case !ok:
-			m.appendEvent(Event{Label: label(r), To: r.State, Msg: r.Msg, At: r.Since})
+			add(Event{Label: label(r), To: r.State, Msg: r.Msg, At: r.Since})
 		case snap.state != r.State:
-			m.appendEvent(Event{Label: label(r), From: snap.state, To: r.State, Msg: r.Msg, At: r.Since})
+			add(Event{Label: label(r), From: snap.state, To: r.State, Msg: r.Msg, At: r.Since})
 		}
 		m.prev[r.ID] = snapOf(r)
 	}
 	for id, snap := range m.prev {
 		if !seen[id] {
-			m.appendEvent(Event{Label: snap.label, From: snap.state, At: now()})
+			add(Event{Label: snap.label, From: snap.state, At: now()})
 			delete(m.prev, id)
 		}
 	}
+	return emitted
 }
 
 // refresh re-gathers state, folds any transitions into the feed, and keeps the
@@ -99,7 +109,9 @@ func (m *model) recordEvents(rows []*Instance) {
 // TUI causes (ack/jump/forget) or observes (tick) is recorded.
 func (m *model) refresh() {
 	rows := gather()
-	m.recordEvents(rows)
+	for _, e := range m.recordEvents(rows) {
+		appendFeedLog(e) // persist what the TUI observes (incl. closes / codex inference)
+	}
 	m.rows = rows
 	if m.cur >= len(m.rows) {
 		m.cur = max(0, len(m.rows)-1)
@@ -181,12 +193,12 @@ func (m model) renderFeed(width, rows int) []string {
 	window, older, newer := m.feedWindow(rows)
 
 	status, statusColor := "", cDim
-	if older > 0 {
-		status += fmt.Sprintf("↑%d ", older)
-	}
-	if m.feedBottomSeq != 0 { // paused above the tail
-		status += fmt.Sprintf("↓%d PgDn=live ", newer)
+	if m.feedBottomSeq != 0 { // scrolled down into history, below the live tail
+		status += fmt.Sprintf("↑%d PgUp=live ", newer)
 		statusColor = cYellow
+	}
+	if older > 0 {
+		status += fmt.Sprintf("↓%d ", older)
 	}
 	head := "── ACTIVITY "
 	fill := max(width-lipgloss.Width(head)-lipgloss.Width(status), 0)
@@ -197,8 +209,10 @@ func (m model) renderFeed(width, rows int) []string {
 	if len(window) == 0 {
 		lines = append(lines, fg(cDim, "   nothing yet — state changes will stream here"))
 	}
-	for _, e := range window {
-		lines = append(lines, m.renderEvent(e, width))
+	// Newest first: the window is stored oldest→newest, so walk it backwards
+	// to put the most recent transition directly under the rule.
+	for i := len(window) - 1; i >= 0; i-- {
+		lines = append(lines, m.renderEvent(window[i], width))
 	}
 	for len(lines) < rows+1 {
 		lines = append(lines, "")

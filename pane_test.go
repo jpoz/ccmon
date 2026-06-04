@@ -141,6 +141,97 @@ const paneDoneQuotesPrompt = `⏺ Earlier I explained the permission prompt:
   ██░░░░░░░░░░░░░░░░░░  12% (121.4k) | Opus 4.8 in ccmon
   ⏵⏵ auto mode on (shift+tab to cycle)`
 
+// Codex fixtures are real `tmux capture-pane -p` output from a live codex
+// v0.136.0 pane, same convention as the Claude ones above.
+
+const codexWorking = `╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.136.0)                  │
+│                                             │
+│ model:     gpt-5.5 xhigh   /model to change │
+│ directory: /private/tmp/cdxprobe            │
+╰─────────────────────────────────────────────╯
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+› Run the shell command: sleep 8 && echo pong. Then reply with just: pong
+• Ran sleep 8 && echo pong
+  └ pong
+• Working (14s • esc to interrupt)
+› Explain this codebase
+  gpt-5.5 xhigh fast · /private/tmp/cdxprobe · Context 99% left · 5h 64% left · weekly 94% left · gpt-5.5`
+
+// A long turn's completion: codex stamps the separator with the elapsed time.
+// This is the exact pane that exposed the stuck-working bug — the row said
+// working while this was on screen.
+const codexDone = `• Opened PR #111:
+
+  https://github.com/beaconsoftware/infra/pull/111
+
+  Title: Update staging Datadog API key secret
+
+  The branch is pushed and in sync with origin/jpoz/new-dd-secret. Verification recorded
+  in the PR body: git diff --check origin/main..HEAD.
+
+─ Worked for 1m 13s ──────────────────────────────────────────────────────────────────────
+
+
+› Write tests for @filename
+
+  gpt-5.5 xhigh fast · ~/Developer/infra · Context 83% left · 5h 69% left · weekly 95% le…`
+
+// A short turn's completion: bare separators, no "Worked for" stamp — pixel
+// identical to sitting idle, so the classifier must return nothing definitive
+// and leave the hook-reported state alone.
+const codexShortDone = `╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.136.0)                  │
+│                                             │
+│ model:     gpt-5.5 xhigh   /model to change │
+│ directory: /private/tmp/cdxprobe            │
+╰─────────────────────────────────────────────╯
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+› Run the shell command: sleep 8 && echo pong. Then reply with just: pong
+• Ran sleep 8 && echo pong
+  └ pong
+──────────────────────────────────────────────────────────────────────────────
+• pong
+──────────────────────────────────────────────────────────────────────────────
+› Explain this codebase
+  gpt-5.5 xhigh fast · /private/tmp/cdxprobe · Context 99% left · 5h 64% left · weekly 94% left · gpt-5.5`
+
+// The directory-trust prompt codex opens with — a numbered Yes/No selector,
+// codex's flavour of needs-input. Exec approval boxes share this shape.
+const codexTrustPrompt = `> You are in /private/tmp/cdxprobe
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of
+  prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue`
+
+func TestClassifyCodexPane(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+		ok   bool
+	}{
+		{"working spinner", codexWorking, StateWorking, true},
+		{"long-turn completion", codexDone, StateDone, true},
+		{"short-turn completion is ambiguous", codexShortDone, "", false},
+		{"trust prompt", codexTrustPrompt, StateNeedsInput, true},
+		{"empty pane", "", "", false},
+		{"plain shell", "$ ls -la\ntotal 0\n$ ", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := classifyCodexPane(tc.text)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("classifyCodexPane = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func TestScrollbackPromptDoesNotFakeNeedsInput(t *testing.T) {
 	if got, _ := classifyClaudePane(paneWorkingQuotesPrompt); got != StateWorking {
 		t.Errorf("working pane quoting a prompt: got %q, want working", got)

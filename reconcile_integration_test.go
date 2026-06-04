@@ -116,6 +116,107 @@ func TestReconcileKeepsAttendedDoneIdle(t *testing.T) {
 	}
 }
 
+// TestReconcileCodexAgainstRealPane covers the codex:infra stuck-working bug:
+// the turn-complete notify recorded "done", a spurious activity bump promoted it
+// back to "working", and nothing ever demoted it — while the pane plainly showed
+// the "─ Worked for 1m 13s ─" separator. Reconcile must read the pane and fix
+// the row, for the approval box too (codex raises no event for either).
+func TestReconcileCodexAgainstRealPane(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping tmux integration test in -short mode")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	t.Setenv("HOME", t.TempDir())
+	sock := filepath.Join(t.TempDir(), "ccmon-codex.sock")
+	t.Cleanup(func() { _, _ = tmux(sock, "kill-server") })
+
+	cases := []struct {
+		name    string
+		fixture string
+		stale   string
+		want    string
+	}{
+		{"stuck working clears to done", codexDone, StateWorking, StateDone},
+		{"trust prompt sets red", codexTrustPrompt, StateWorking, StateNeedsInput},
+		{"new turn revives done", codexWorking, StateDone, StateWorking},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pane := paintPane(t, sock, tc.fixture)
+			inst := &Instance{
+				ID: "test-codex-" + tc.name, Source: "codex",
+				Socket: sock, PaneID: pane, State: tc.stale, Since: now(),
+			}
+			changed, prev := reconcileCodex(inst, now())
+			if !changed {
+				t.Fatalf("expected reconcile to change state from %q", tc.stale)
+			}
+			if prev != tc.stale {
+				t.Errorf("prev = %q, want %q", prev, tc.stale)
+			}
+			if inst.State != tc.want {
+				t.Errorf("state = %q, want %q (pane:\n%s)", inst.State, tc.want, tc.fixture)
+			}
+		})
+	}
+}
+
+// TestReconcileCodexQuietDemotion covers the ambiguous short-turn screen: chrome
+// with no work marker must not touch a fresh "working" (mid-turn render blink),
+// but once the pane has been quiet past codexQuietSecs a claimed "working" is a
+// lie — demote it to idle, keeping the last completion message on the row.
+func TestReconcileCodexQuietDemotion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping tmux integration test in -short mode")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	t.Setenv("HOME", t.TempDir())
+	sock := filepath.Join(t.TempDir(), "ccmon-codex-quiet.sock")
+	t.Cleanup(func() { _, _ = tmux(sock, "kill-server") })
+
+	pane := paintPane(t, sock, codexShortDone)
+
+	fresh := &Instance{
+		ID: "codex-fresh", Source: "codex", Socket: sock, PaneID: pane,
+		State: StateWorking, Since: now(),
+	}
+	if changed, _ := reconcileCodex(fresh, now()); changed {
+		t.Errorf("fresh activity: changed = true, want false (could be a render blink)")
+	}
+	if fresh.State != StateWorking {
+		t.Errorf("fresh activity: state = %q, want %q", fresh.State, StateWorking)
+	}
+
+	quiet := &Instance{
+		ID: "codex-quiet", Source: "codex", Socket: sock, PaneID: pane,
+		State: StateWorking, Msg: "Opened PR #111:", Since: now(),
+	}
+	changed, _ := reconcileCodex(quiet, now()-codexQuietSecs-5)
+	if !changed {
+		t.Fatal("quiet pane: expected stale working to demote")
+	}
+	if quiet.State != StateIdle {
+		t.Errorf("quiet pane: state = %q, want %q", quiet.State, StateIdle)
+	}
+	if quiet.Msg != "Opened PR #111:" {
+		t.Errorf("quiet pane: Msg = %q, want the completion summary kept", quiet.Msg)
+	}
+
+	// A done row on the same ambiguous screen stays done — the hook said the
+	// turn finished and nothing on the pane contradicts it.
+	done := &Instance{
+		ID: "codex-done", Source: "codex", Socket: sock, PaneID: pane,
+		State: StateDone, Since: now(),
+	}
+	if changed, _ := reconcileCodex(done, now()-codexQuietSecs-5); changed {
+		t.Errorf("done row: changed = true, want false (ambiguous screen must not clobber done)")
+	}
+}
+
 // paintPane creates a pane that displays the given text and stays alive, then
 // returns its pane id once the content has actually rendered.
 func paintPane(t *testing.T, sock, text string) string {

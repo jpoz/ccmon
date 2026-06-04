@@ -16,57 +16,72 @@ import (
 // scan (to discover codex panes that haven't fired an event yet), prunes panes
 // that have closed, and returns the list sorted by urgency.
 func gather() []*Instance {
+	panes := scanPanes()
+	paneByKey := make(map[string]paneInfo, len(panes))
+	for _, p := range panes {
+		paneByKey[p.socket+"|"+p.paneID] = p
+	}
+
 	byKey := map[string]*Instance{}
 	for _, inst := range loadAll() {
 		if inst.PaneID != "" && !paneExists(inst.Socket, inst.PaneID) {
 			removeInstance(inst.ID) // pane closed → forget it
 			continue
 		}
-		// Self-heal: trust the live pane over possibly-stale hook state. This is
-		// what clears a session stuck on needs-input after you grant permission.
-		if changed, prev := reconcileClaude(inst); changed &&
-			inst.State == StateNeedsInput && prev != StateNeedsInput {
+		// Self-heal: trust the live pane over possibly-stale hook state. For
+		// Claude this is what clears a session stuck on needs-input after you
+		// grant permission; for codex it's the only mid-turn signal there is —
+		// a new turn starting, an approval box, or a stale "working" (codex
+		// fires no event for any of those, only the end-of-turn notify).
+		var changed bool
+		var prev string
+		switch inst.Source {
+		case "claude":
+			changed, prev = reconcileClaude(inst)
+		case "codex":
+			changed, prev = reconcileCodex(inst, paneByKey[inst.Socket+"|"+inst.PaneID].activity)
+		}
+		if changed && inst.State == StateNeedsInput && prev != StateNeedsInput {
 			// A permission box is up that no hook told us about — alert as if the
 			// Notification hook had fired.
 			notify(inst, StateNeedsInput)
 		}
 		byKey[inst.Socket+"|"+inst.PaneID] = inst
 	}
-	for _, p := range scanPanes() {
+	for _, p := range panes {
 		if !isCodexCommand(p.command) {
 			continue
 		}
 		key := p.socket + "|" + p.paneID
-		if ex, ok := byKey[key]; ok {
-			// Codex emits no "started" event, so infer renewed activity from
-			// tmux: output newer than the last known state means it's working
-			// again. This also revives a codex pane the user attended (idle) —
-			// without it, a jumped-to codex would sit idle through its next turn
-			// until completion. (Claude reports its own state, so leave it alone.)
-			if ex.Source == "codex" && p.activity > ex.Since+3 &&
-				(ex.State == StateDone || (ex.State == StateIdle && ex.Attended)) {
-				ex.State = StateWorking
-				ex.Since = p.activity
-				ex.Attended = false
-			}
+		if _, ok := byKey[key]; ok {
 			continue // already have a richer, event-backed record
 		}
+		// First sighting, no event yet: read the pane for a state; if it shows
+		// nothing definitive (chrome only), an event-less codex is just idle.
+		// Fall back to recency of output when even the chrome isn't legible.
 		st := StateWorking
 		if now()-p.activity > 30 {
 			st = StateIdle
 		}
+		if text, ok := capturePane(p.socket, p.paneID); ok {
+			if s, ok := classifyCodexPane(text); ok {
+				st = s
+			} else if reCodexChrome.MatchString(text) {
+				st = StateIdle
+			}
+		}
 		byKey[key] = &Instance{
-			ID:      "cdx-" + filepath.Base(p.socket) + "-" + strings.TrimPrefix(p.paneID, "%"),
-			Source:  "codex",
-			Project: filepath.Base(p.path),
-			Cwd:     p.path,
-			State:   st,
-			Since:   p.activity,
-			Socket:  p.socket,
-			Session: p.session,
-			Window:  p.window,
-			WinName: p.winName,
-			PaneID:  p.paneID,
+			ID:       "cdx-" + filepath.Base(p.socket) + "-" + strings.TrimPrefix(p.paneID, "%"),
+			Source:   "codex",
+			Project:  filepath.Base(p.path),
+			Cwd:      p.path,
+			State:    st,
+			Since:    p.activity,
+			Socket:   p.socket,
+			Session:  p.session,
+			Window:   p.window,
+			WinName:  p.winName,
+			PaneID:   p.paneID,
 			inferred: true,
 		}
 	}
@@ -104,12 +119,12 @@ func nagInterval() int64 {
 }
 
 type model struct {
-	rows   []*Instance
-	cur    int
-	w, h   int
-	status string
-	frame  int                 // animation frame counter (bumped every tick)
-	nag    map[string]int64    // instance id -> unix secs of last notification
+	rows          []*Instance
+	cur           int
+	w, h          int
+	status        string
+	frame         int                 // animation frame counter (bumped every tick)
+	nag           map[string]int64    // instance id -> unix secs of last notification
 	events        []Event             // activity feed, oldest first (see feed.go)
 	prev          map[string]instSnap // last-seen state per instance, for diffing
 	feed          bool                // whether the activity-feed panel is shown
@@ -221,10 +236,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "f": // toggle the activity-feed panel
 			m.feed = !m.feed
 			m.feedBottomSeq = 0 // (re)open streaming live
-		case "pgup", "ctrl+u": // scroll the feed toward older events
-			m.scrollFeed(-1)
-		case "pgdown", "ctrl+d": // scroll back toward the live tail
+		case "pgup", "ctrl+u": // newest is at the top → scroll up toward the live tail
 			m.scrollFeed(1)
+		case "pgdown", "ctrl+d": // scroll down into older history
+			m.scrollFeed(-1)
 		case "r":
 			m.refresh()
 		}
@@ -528,8 +543,25 @@ func padRight(s string, n int) string {
 func runTUI() {
 	rows := gather()
 	m := model{rows: rows, nag: map[string]int64{}, prev: seedSnaps(rows), muted: isMuted(), backend: notifyBackend()}
+	m.loadHistory()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, _ = p.Run()
+}
+
+// loadHistory seeds the in-memory feed with the persisted last-24h events so the
+// panel opens with context instead of empty. Disk Seqs come from independent hook
+// processes and are meaningless here, so they're renumbered contiguously (the
+// scroll math in feed.go assumes ascending +1 seqs); feedSeq then continues from
+// the end so live events keep climbing. born is pushed past the flash window so
+// history doesn't pulse on open — only genuinely new events flash.
+func (m *model) loadHistory() {
+	hist := loadFeedLog()
+	for i := range hist {
+		m.feedSeq++
+		hist[i].Seq = m.feedSeq
+		hist[i].born = -len(flashRamp) * flashStep
+	}
+	m.events = hist
 }
 
 func runList() {

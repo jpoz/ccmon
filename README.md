@@ -80,22 +80,31 @@ it. Without that hook a session stayed stuck on `needs-input` until the whole
 turn ended.
 
 **2. Pane reconciliation (self-healing, pull):** every TUI poll, each Claude
-pane is captured (`tmux capture-pane`) and classified directly from what's on
-screen — a permission box (`Do you want to proceed?` + `❯ 1. Yes`) ⇒
-`needs-input`, a live spinner (`Germinating… (4m 44s · ↓ 18.1k tokens)`) ⇒
-`working`, a completed line (`✻ Cooked for 1m 39s` / `※ recap:`) ⇒ `done`. The
-pane is ground truth for whether Claude is blocked on you, so this corrects any
-hook that was missed, delayed, or never fired. `classifyClaudePane` in `pane.go`
-is a pure function; `reconcileClaude` applies it.
+and codex pane is captured (`tmux capture-pane`) and classified directly from
+what's on screen — a permission box (`Do you want to proceed?` + `❯ 1. Yes`,
+or codex's `› 1. Yes, continue` approvals) ⇒ `needs-input`, a live spinner
+(`Germinating… (4m 44s · ↓ 18.1k tokens)` / `• Working (14s • esc to
+interrupt)`) ⇒ `working`, a completed line (`✻ Cooked for 1m 39s` / `※ recap:`
+/ `─ Worked for 1m 13s ─`) ⇒ `done`. The pane is ground truth for whether the
+agent is blocked on you, so this corrects any hook that was missed, delayed,
+or never fired. It matters doubly for codex, which fires exactly **one** event
+per turn (the completion notify): a new turn starting, an approval box
+appearing, and a stale `working` are all visible only on the pane. One codex
+quirk: short-turn completions are pixel-identical to an idle composer, so an
+ambiguous screen never overrides hook state — except a claimed `working` on a
+pane that's gone quiet (a real turn redraws its elapsed timer every second),
+which demotes to `idle`. `classifyClaudePane` / `classifyCodexPane` in
+`pane.go` are pure functions; `reconcileClaude` / `reconcileCodex` apply them.
 
 State lives in `~/.ccmon/state/<id>.json`, one file per instance.
 Each pane is also tagged with a `@cc_state` tmux user option for status bars.
 
 - **Claude** instances report rich state via hooks (keyed by session id), then
   get reconciled against their live pane.
-- **Codex** instances report `done` via the `notify` program, and are also
-  auto-discovered by scanning tmux even before their first event (state inferred
-  from pane activity; shown with a `~` marker).
+- **Codex** instances report `done` via the `notify` program, get reconciled
+  against their live pane for everything in between, and are also
+  auto-discovered by scanning tmux even before their first event (state read
+  from the pane, falling back to output recency; shown with a `~` marker).
 
 Instances are pruned automatically when their pane closes.
 
@@ -108,7 +117,8 @@ Instances are pruned automatically when their pane closes.
   (working / done / idle / permission / resumed-after-grant).
 - `hook_test.go` — the hook state machine, incl. `needs-input → PostToolUse → working`.
 - `reconcile_integration_test.go` — paints fixtures into a throwaway tmux pane
-  and asserts `reconcileClaude` reads the live pane and corrects stale state.
+  and asserts `reconcileClaude` / `reconcileCodex` read the live pane and
+  correct stale state (including the quiet-pane stale-`working` demotion).
 
 ## Wiring (managed by `ccmon install`)
 
@@ -186,16 +196,25 @@ The panel is **responsive**: on a wide terminal it docks as a full-height column
 to the right of the table; on a narrow one it drops to a strip below it. Either
 way the table + feed are centered as a card so nothing smears edge-to-edge.
 
-`PgUp`/`PgDn` (or `Ctrl-U`/`Ctrl-D`) scroll back through history. Scrolling is
-**sequence-anchored**, so new events streaming in while you read don't lurch the
-view; a `↑N`/`↓N PgDn=live` marker on the panel's title shows how much is off
-screen, and scrolling back to the bottom re-engages live-follow.
+The **newest event sits at the top**, directly under the `── ACTIVITY` rule.
+`PgUp`/`Ctrl-U` scroll up toward the live tail; `PgDn`/`Ctrl-D` scroll down into
+older history. Scrolling is **sequence-anchored**, so new events streaming in
+while you read don't lurch the view; a `↑N PgUp=live` / `↓N` marker on the
+panel's title shows how much is off screen, and scrolling back up to the tail
+re-engages live-follow.
 
-It's derived purely by diffing successive polls (`recordEvents` in `feed.go`),
-so it captures everything the TUI observes — hook-driven changes, pane
-reconciliation, codex activity, and your own ack/jump — with no extra hook
-wiring. The buffer is in-memory and ephemeral: it shows activity since you
-opened the TUI, and seeds silently so already-running sessions don't flood it.
+The live view is derived by diffing successive polls (`recordEvents` in
+`feed.go`), so it captures everything the TUI observes — hook-driven changes,
+pane reconciliation, codex activity, and your own ack/jump. All of it is
+**persisted to `~/.ccmon/feed.jsonl`**, pruned to the last 24h, so the panel
+opens with a day of history instead of a blank slate. Two writers feed the log:
+the **hooks** record every transition they drive (so history accrues even when
+the TUI is closed), and the **TUI** records what only it can see — pane-closes
+and pane-reconciled corrections, which fire no hook. A transition seen by
+both lands twice and is collapsed on load (`dedupeEvents` in `feedlog.go`); the
+log seeds silently so already-running sessions don't flood it. The only gap is
+events that happen with the TUI closed and no hook to catch them — a killed pane
+or a codex turn while you're away won't be in the history.
 
 ## Re-notifications (nagging)
 

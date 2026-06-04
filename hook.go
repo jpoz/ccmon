@@ -30,6 +30,9 @@ func runHook() {
 	}
 
 	if p.HookEventName == "SessionEnd" {
+		if inst, ok := loadInstance(p.SessionID); ok {
+			appendFeedLog(Event{Label: label(inst), From: inst.State, To: "", At: now()})
+		}
 		removeInstance(p.SessionID)
 		return
 	}
@@ -49,10 +52,16 @@ func runHook() {
 		inst.Session, inst.Window, inst.WinName = sess, win, winName
 	}
 
+	prev := inst.State
 	notifyKind := applyClaudeEvent(inst, p)
 
 	_ = inst.save()
 	tagPane(inst) // best-effort tmux marker for status bars
+	// Log the transition durably (Msg is final by now — applyClaudeEvent sets it
+	// after the state change). From "" reads as an appearance in the feed.
+	if inst.State != prev {
+		appendFeedLog(Event{Label: label(inst), From: prev, To: inst.State, Msg: inst.Msg, At: inst.Since})
+	}
 	if notifyKind != "" {
 		notify(inst, notifyKind)
 	}
@@ -131,9 +140,13 @@ func runCodexHook(args []string) {
 		inst.Msg = firstLine(p.LastAssistantMessage)
 	}
 	// codex only notifies on turn completion → it's now waiting on you.
+	prev := inst.State
 	inst.setState(StateDone)
 	_ = inst.save()
 	tagPane(inst)
+	if inst.State != prev {
+		appendFeedLog(Event{Label: label(inst), From: prev, To: inst.State, Msg: inst.Msg, At: inst.Since})
+	}
 	notify(inst, StateDone)
 }
 
