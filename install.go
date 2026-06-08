@@ -146,7 +146,24 @@ func runDoctor() {
 		}
 	}
 
+	fmt.Println("\nJump / focus:")
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("CCMON_FOCUS")))
+	if mode == "" {
+		mode = "auto"
+	}
+	fmt.Printf("  terminal: %s · CCMON_FOCUS=%s · interactive split-focus %s\n",
+		ternary(inGhostty(), "Ghostty", "non-Ghostty"), mode,
+		ternary(ghosttyFocusEnabled(), "on", "off"))
+
 	fmt.Printf("\nState dir:     %s (%d instance(s))\n", stateDir(), len(loadAll()))
+}
+
+// ternary is a tiny string-only conditional for terse status lines.
+func ternary(cond bool, yes, no string) string {
+	if cond {
+		return yes
+	}
+	return no
 }
 
 // --- Claude Code hooks (settings.json) -------------------------------------

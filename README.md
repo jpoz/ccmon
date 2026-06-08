@@ -56,7 +56,7 @@ works, the installer wires whatever path the binary lives at:
 | `ccmon doctor`     | you / debugging                       | report install status + dependency health     |
 | `ccmon hook`       | Claude Code hooks (JSON on stdin)     | update state, notify on needs-input / done    |
 | `ccmon codex-hook` | codex `notify` (JSON in argv)         | update state, notify on turn-complete         |
-| `ccmon jump <id>`  | notification click / TUI Return       | select the pane + `open -a Ghostty`           |
+| `ccmon jump <id>`  | notification click / TUI Return       | select the pane + focus its terminal split    |
 | `ccmon tui`        | you (`ccmon` with no args = tui)      | live router; arrow + Return to jump           |
 | `ccmon list`       | you / debugging                       | plain-text dump of current state              |
 | `ccmon test-notification` | you / debugging                | fire one notification by hand (`--osc` / `--plain` / `--done` / `--nag`) |
@@ -140,6 +140,33 @@ removes them — but for reference, the wiring is:
 `x` forget instance · `f` toggle activity feed · `PgUp/PgDn` (or `Ctrl-U/Ctrl-D`)
 scroll the feed · `m` mute/unmute sounds · `n` switch notify backend ·
 `r` refresh · `q` quit
+
+## Jumping to a pane (Ghostty splits)
+
+`Enter` (or a notification click) jumps to the selected instance. Jumping is two
+moves:
+
+1. **tmux navigation** — `switch-client` + `select-window` + `select-pane` point
+   your attached tmux client at the exact window+pane. This is terminal-agnostic
+   and is the whole story if you run ccmon and your sessions in one client.
+2. **terminal focus** — moving your OS keyboard focus to where that pane now
+   lives. tmux can't do this: if ccmon sits in one **Ghostty split** and your
+   tmux session in another, switching the tmux client redraws the other split but
+   your focus stays on ccmon.
+
+So when ccmon detects it's running inside Ghostty, an interactive `Enter` asks
+Ghostty (via its [AppleScript dictionary](https://ghostty.org/docs/features/applescript),
+**Ghostty ≥ 1.3.0**) to focus the **sibling split** in the same tab — the one
+running tmux. In the common ccmon-beside-tmux layout that's unambiguous; with 3+
+splits in the tab it prefers a sibling whose working directory matches the target
+pane, falling back to the first sibling. The first jump triggers a one-time macOS
+prompt to let ccmon control Ghostty (**System Settings → Privacy & Security →
+Automation**).
+
+**Not on Ghostty?** Nothing changes for you: ccmon detects it isn't in Ghostty
+and skips the AppleScript entirely (no spurious app launch), leaving your
+`switch-client` workflow exactly as before. Override the autodetect with
+`CCMON_FOCUS` (see below) — `ghostty` to force it, `none` to turn it off.
 
 ## Notification sounds & mute
 
@@ -233,4 +260,8 @@ the repeating reminders just need the TUI up (e.g. in a dashboard pane).
 | var               | default | effect                                              |
 |-------------------|---------|-----------------------------------------------------|
 | `CCMON_NAG_SECS`  | `60`    | seconds between re-notifications of a red session   |
+| `CCMON_FOCUS`     | `auto`  | terminal split-focus on jump: `auto` (focus the Ghostty sibling split only when ccmon is in Ghostty), `ghostty` (force it), `none`/`off` (tmux navigation only) |
 | `CCMON_DEBUG`     | unset   | append every notification to `~/.ccmon/notify.log`  |
+
+`ccmon doctor` prints which terminal it detected and whether interactive
+split-focus is on.
