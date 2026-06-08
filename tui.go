@@ -483,29 +483,54 @@ func colHeadLine(width int) string {
 		padRight("PROJECT", colProj+1)+padRight("AGE", colAge+1)+"MESSAGE")
 }
 
+// packBody works out how the table rows fit into a `maxRows` line budget. In
+// narrow mode a row with a message takes two lines and a message-less row takes
+// one; in wide mode every row is a single line. When not everything fits it
+// reserves a line for the "… and N more" indicator. It returns how many leading
+// rows to show, how many are dropped, and the total lines the body occupies.
+// renderBody and bodyLineCount share it so the feed-split math agrees with what
+// is actually drawn.
+func packBody(rows []*Instance, maxRows int, narrow bool) (shown, overflow, lines int) {
+	height := func(r *Instance) int {
+		if narrow && r.Msg != "" {
+			return 2
+		}
+		return 1
+	}
+	total := 0
+	for _, r := range rows {
+		total += height(r)
+	}
+	if total <= maxRows {
+		return len(rows), 0, total
+	}
+	budget := max(maxRows-1, 0) // reserve a line for "… and N more"
+	used := 0
+	for _, r := range rows {
+		h := height(r)
+		if used+h > budget {
+			break
+		}
+		used += h
+		shown++
+	}
+	return shown, len(rows) - shown, used + 1
+}
+
 // renderBody formats the table rows for a column `width` wide, limited to
 // `maxRows` lines; if there are more instances than fit it surfaces the dropped
-// count rather than silently truncating. When `width` is below narrowWidth each
-// instance spans two lines (tool/project/age, then message), so the line budget
-// holds half as many.
+// count rather than silently truncating. When `width` is below narrowWidth a row
+// wraps to a second line for its message (message-less rows stay one line).
 func (m model) renderBody(width, maxRows int) []string {
 	if len(m.rows) == 0 {
 		return []string{"", fg(cDim,
 			"    no claude or codex instances detected — start one and it'll show up here")}
 	}
-	perRow := 1
-	if width < narrowWidth {
-		perRow = 2
-	}
-	maxInst := max(maxRows/perRow, 1)
-	rows, overflow := m.rows, 0
-	if len(rows) > maxInst {
-		overflow = len(rows) - (maxInst - 1)
-		rows = rows[:maxInst-1]
-	}
-	body := make([]string, 0, len(rows)*perRow+1)
-	for idx, r := range rows {
-		body = append(body, m.renderRow(idx, r, width, perRow == 2)...)
+	narrow := width < narrowWidth
+	shown, overflow, _ := packBody(m.rows, maxRows, narrow)
+	body := make([]string, 0, maxRows)
+	for idx, r := range m.rows[:shown] {
+		body = append(body, m.renderRow(idx, r, width, narrow)...)
 	}
 	if overflow > 0 {
 		body = append(body, fg(cDim, fmt.Sprintf("    … and %d more", overflow)))
@@ -521,15 +546,8 @@ func (m model) bodyLineCount(width, maxRows int) int {
 	if len(m.rows) == 0 {
 		return min(2, maxRows)
 	}
-	perRow := 1
-	if width < narrowWidth {
-		perRow = 2
-	}
-	maxInst := max(maxRows/perRow, 1)
-	if len(m.rows) > maxInst {
-		return (maxInst-1)*perRow + 1 // shown instances + the "… and N more" line
-	}
-	return len(m.rows) * perRow
+	_, _, lines := packBody(m.rows, maxRows, width < narrowWidth)
+	return lines
 }
 
 // renderRow formats one instance, returning the one or two lines it occupies.
@@ -594,7 +612,6 @@ func (m model) renderRowNarrow(idx int, r *Instance, width int) []string {
 		projW = max(room, 4)
 	}
 	proj := padRight(truncate(r.Project, projW), projW)
-	msg := truncate(r.Msg, max(width-4-1, 6))
 
 	if sel {
 		seg := func(c lipgloss.Color, bold bool, s string) string {
@@ -603,11 +620,19 @@ func (m model) renderRowNarrow(idx int, r *Instance, width int) []string {
 		line1 := seg(cAccent, false, "▌ ") + seg(sc, false, glyph+" ") +
 			seg(cFg, true, tool+" ") + seg(cFg, true, proj+" ") +
 			seg(cDim, false, age) + seg(cDim, false, meta)
+		if r.Msg == "" {
+			return []string{padBg(line1, width, cSelBg)}
+		}
+		msg := truncate(r.Msg, max(width-4-1, 6))
 		line2 := seg(cAccent, false, "▌ ") + seg(cFg, false, "  "+msg)
 		return []string{padBg(line1, width, cSelBg), padBg(line2, width, cSelBg)}
 	}
 	line1 := "  " + fg(sc, glyph+" ") + fg(cDim, tool+" ") + fg(cFg, proj+" ") +
 		fg(cDim, age) + fg(cDim, meta)
+	if r.Msg == "" {
+		return []string{line1}
+	}
+	msg := truncate(r.Msg, max(width-4-1, 6))
 	line2 := fg(cDim, "    "+msg)
 	return []string{line1, line2}
 }
