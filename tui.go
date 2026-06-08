@@ -194,7 +194,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.cur < len(m.rows) {
 				inst := m.rows[m.cur]
-				if err := jumpTo(inst); err != nil {
+				if err := jumpTo(inst, true); err != nil {
 					m.status = "jump failed: " + err.Error()
 				} else {
 					m.status = "→ " + label(inst)
@@ -325,6 +325,12 @@ const (
 	colProj = 16
 	colAge  = 7
 
+	// narrowWidth is the content width below which a single-line row leaves too
+	// little room for the message, so rows wrap to two lines: tool/project/age on
+	// top, the message indented beneath. Tuned so the wrap kicks in only on a
+	// genuinely cramped split, not a merely smallish terminal.
+	narrowWidth = 60
+
 	// maxContentWidth caps how wide the panel grows. Past this the table stops
 	// stretching and gets centered, so it reads as a card on a big monitor
 	// instead of smearing edge-to-edge; narrower terminals still use full width.
@@ -347,26 +353,34 @@ func (m model) View() string {
 
 // viewStacked is the default layout: a horizontally centered card with the
 // table on top and — when the feed is open and the terminal is too narrow for a
-// side column — a feed strip pinned above the footer.
+// side column — the activity panel filling the gap down to the footer.
 func (m model) viewStacked(termW, termH int) string {
 	width := min(termW, maxContentWidth)
 	indent := strings.Repeat(" ", max((termW-width)/2, 0))
 
-	var feedLines []string
+	// Region between the col-header and the footer (header, blank, col-header,
+	// footer = 4 fixed lines) is shared by the table and, when open, the feed.
+	region := max(termH-4, 1)
+
+	var body, feedLines []string
 	if m.feed {
-		feedLines = m.renderFeed(width, feedMaxLines)
+		// The table takes only the rows it needs; the activity panel grows to
+		// fill the rest of the region (feedLayout computes the matching split so
+		// the scroll handler agrees on the visible window).
+		_, _, _, feedRows := m.feedLayout()
+		body = m.renderBody(width, max(region-feedRows-1, 1))
+		feedLines = m.renderFeed(width, feedRows)
+	} else {
+		body = m.renderBody(width, region)
 	}
-	// Keep the footer pinned: reserve header, blank, col-header, blank, footer
-	// (5 lines) plus the feed strip; the table gets what's left.
-	body := m.renderBody(width, max(termH-5-len(feedLines), 1))
 
 	var b strings.Builder
 	b.WriteString(indent + m.headerBar(width) + "\n\n")
-	b.WriteString(indent + colHeadLine() + "\n")
+	b.WriteString(indent + colHeadLine(width) + "\n")
 	for _, line := range body {
 		b.WriteString(indent + line + "\n")
 	}
-	if fill := termH - 4 - len(body) - len(feedLines); fill > 0 {
+	if fill := region - len(body) - len(feedLines); fill > 0 {
 		b.WriteString(strings.Repeat("\n", fill))
 	}
 	for _, line := range feedLines {
@@ -388,7 +402,7 @@ func (m model) viewSide(termW, tableW, feedW, feedRows int) string {
 	regionH := feedRows + 1
 
 	// Left column: column header + table rows, padded to the region height.
-	left := append([]string{colHeadLine()}, m.renderBody(tableW, feedRows)...)
+	left := append([]string{colHeadLine(tableW)}, m.renderBody(tableW, feedRows)...)
 	// Right column: the feed panel, filling the same height.
 	right := m.renderFeed(feedW, feedRows)
 
@@ -459,28 +473,39 @@ func (m model) footerBar(width int) string {
 	return footer
 }
 
-// colHeadLine is the dim table column header.
-func colHeadLine() string {
+// colHeadLine is the dim table column header. In narrow mode the message moves
+// to its own row per instance, so the header drops the MESSAGE column to match.
+func colHeadLine(width int) string {
+	if width < narrowWidth {
+		return fg(cDim, "    "+padRight("TOOL", colTool+1)+padRight("PROJECT", colProj+1)+"AGE")
+	}
 	return fg(cDim, "    "+padRight("TOOL", colTool+1)+
 		padRight("PROJECT", colProj+1)+padRight("AGE", colAge+1)+"MESSAGE")
 }
 
 // renderBody formats the table rows for a column `width` wide, limited to
-// `maxRows`; if there are more instances than fit it surfaces the dropped count
-// rather than silently truncating.
+// `maxRows` lines; if there are more instances than fit it surfaces the dropped
+// count rather than silently truncating. When `width` is below narrowWidth each
+// instance spans two lines (tool/project/age, then message), so the line budget
+// holds half as many.
 func (m model) renderBody(width, maxRows int) []string {
 	if len(m.rows) == 0 {
 		return []string{"", fg(cDim,
 			"    no claude or codex instances detected — start one and it'll show up here")}
 	}
-	rows, overflow := m.rows, 0
-	if len(rows) > maxRows {
-		overflow = len(rows) - (maxRows - 1)
-		rows = rows[:maxRows-1]
+	perRow := 1
+	if width < narrowWidth {
+		perRow = 2
 	}
-	body := make([]string, 0, len(rows)+1)
+	maxInst := max(maxRows/perRow, 1)
+	rows, overflow := m.rows, 0
+	if len(rows) > maxInst {
+		overflow = len(rows) - (maxInst - 1)
+		rows = rows[:maxInst-1]
+	}
+	body := make([]string, 0, len(rows)*perRow+1)
 	for idx, r := range rows {
-		body = append(body, m.renderRow(idx, r, width))
+		body = append(body, m.renderRow(idx, r, width, perRow == 2)...)
 	}
 	if overflow > 0 {
 		body = append(body, fg(cDim, fmt.Sprintf("    … and %d more", overflow)))
@@ -488,11 +513,39 @@ func (m model) renderBody(width, maxRows int) []string {
 	return body
 }
 
-// renderRow formats one instance as a single padded line. The state glyph is
+// bodyLineCount reports how many terminal lines renderBody will occupy for the
+// current rows at `width`, capped at `maxRows`. It mirrors renderBody's packing
+// so feedLayout can split the screen without rendering — both View and the
+// scroll handler must agree on the feed's visible window.
+func (m model) bodyLineCount(width, maxRows int) int {
+	if len(m.rows) == 0 {
+		return min(2, maxRows)
+	}
+	perRow := 1
+	if width < narrowWidth {
+		perRow = 2
+	}
+	maxInst := max(maxRows/perRow, 1)
+	if len(m.rows) > maxInst {
+		return (maxInst-1)*perRow + 1 // shown instances + the "… and N more" line
+	}
+	return len(m.rows) * perRow
+}
+
+// renderRow formats one instance, returning the one or two lines it occupies.
+// In narrow mode the message wraps to its own line beneath tool/project/age.
+func (m model) renderRow(idx int, r *Instance, width int, narrow bool) []string {
+	if narrow {
+		return m.renderRowNarrow(idx, r, width)
+	}
+	return []string{m.renderRowWide(idx, r, width)}
+}
+
+// renderRowWide formats one instance as a single padded line. The state glyph is
 // always tinted with the state color; on the selected row everything sits on a
 // highlight background (each segment carries that background so the bar fills
 // cleanly across the ANSI resets between colored runs).
-func (m model) renderRow(idx int, r *Instance, width int) string {
+func (m model) renderRowWide(idx int, r *Instance, width int) string {
 	sel := idx == m.cur
 	sc := stateColor(r.State)
 	glyph := m.glyph(r.State)
@@ -515,14 +568,57 @@ func (m model) renderRow(idx int, r *Instance, width int) string {
 		line := seg(cAccent, false, "▌ ") + seg(sc, false, glyph+" ") +
 			seg(cFg, true, tool+" ") + seg(cFg, true, proj+" ") +
 			seg(cDim, false, age+" ") + seg(cFg, false, msg) + seg(cDim, false, meta)
-		used := 2 + 2 + colTool + 1 + colProj + 1 + colAge + 1 + len([]rune(msg)) + len([]rune(meta))
-		if pad := width - used; pad > 0 {
-			line += lipgloss.NewStyle().Background(cSelBg).Render(strings.Repeat(" ", pad))
-		}
-		return line
+		return padBg(line, width, cSelBg)
 	}
 	return "  " + fg(sc, glyph+" ") + fg(cDim, tool+" ") + fg(cFg, proj+" ") +
 		fg(cDim, age+" ") + fg(cDim, msg) + fg(cDim, meta)
+}
+
+// renderRowNarrow lays one instance across two lines for a cramped width: the
+// state glyph, tool, project, and age on the first; the message indented on the
+// second. The project column is kept fixed so age still lines up under the
+// header, shrinking only when the width genuinely can't hold it.
+func (m model) renderRowNarrow(idx int, r *Instance, width int) []string {
+	sel := idx == m.cur
+	sc := stateColor(r.State)
+	glyph := m.glyph(r.State)
+	tool := padRight(titleCase(r.Source), colTool)
+	age := dur(r.Since)
+
+	meta := "" // inferred (scan-discovered, no event yet) gets a subtle marker
+	if r.inferred {
+		meta = " ~"
+	}
+	projW := colProj
+	if room := width - (2 + 2 + colTool + 1 + 1 + colAge + len([]rune(meta))); room < projW {
+		projW = max(room, 4)
+	}
+	proj := padRight(truncate(r.Project, projW), projW)
+	msg := truncate(r.Msg, max(width-4-1, 6))
+
+	if sel {
+		seg := func(c lipgloss.Color, bold bool, s string) string {
+			return lipgloss.NewStyle().Background(cSelBg).Foreground(c).Bold(bold).Render(s)
+		}
+		line1 := seg(cAccent, false, "▌ ") + seg(sc, false, glyph+" ") +
+			seg(cFg, true, tool+" ") + seg(cFg, true, proj+" ") +
+			seg(cDim, false, age) + seg(cDim, false, meta)
+		line2 := seg(cAccent, false, "▌ ") + seg(cFg, false, "  "+msg)
+		return []string{padBg(line1, width, cSelBg), padBg(line2, width, cSelBg)}
+	}
+	line1 := "  " + fg(sc, glyph+" ") + fg(cDim, tool+" ") + fg(cFg, proj+" ") +
+		fg(cDim, age) + fg(cDim, meta)
+	line2 := fg(cDim, "    "+msg)
+	return []string{line1, line2}
+}
+
+// padBg right-pads a rendered line to `width` with a background-colored run so a
+// highlighted row fills cleanly across the ANSI resets between colored segments.
+func padBg(line string, width int, bg lipgloss.Color) string {
+	if pad := width - lipgloss.Width(line); pad > 0 {
+		return line + lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", pad))
+	}
+	return line
 }
 
 func titleCase(s string) string {

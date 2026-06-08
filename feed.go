@@ -50,7 +50,7 @@ func seedSnaps(rows []*Instance) map[string]instSnap {
 
 const (
 	maxFeedEvents = 200 // ring-buffer cap; older events scroll off the top
-	feedMaxLines  = 6   // event rows shown in the bottom (stacked) panel
+	feedMinLines  = 4   // floor for the stacked activity panel when the table is crowded
 	feedAgeW      = 5
 	feedLabelW    = 18
 
@@ -139,7 +139,14 @@ func (m model) feedLayout() (side bool, tableW, feedW, rows int) {
 		// one of its rows is the panel's own title, leaving termH-4 for events.
 		return true, min(tableW, maxContentWidth), feedW, max(termH-4, 1)
 	}
-	return false, min(termW, maxContentWidth), 0, feedMaxLines
+	// Stacked: the table takes only the rows it needs and the activity panel
+	// fills the rest of the region down to the footer (with a floor so it stays
+	// useful when the table is crowded). Region = termH minus header(1), blank(1),
+	// col-header(1), footer(1); the feed's own title rule takes one more line.
+	width := min(termW, maxContentWidth)
+	region := max(termH-4, 1)
+	bodyH := m.bodyLineCount(width, max(region-feedMinLines-1, 1))
+	return false, width, 0, max(region-bodyH-1, feedMinLines)
 }
 
 // idxOfSeq maps an event sequence number to its slice index. Seqs are contiguous

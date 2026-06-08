@@ -96,11 +96,11 @@ func TestViewLineCount(t *testing.T) {
 // and — crucially — does not lurch when new events stream in while paused.
 // Reaching the tail re-engages follow mode.
 func TestFeedScroll(t *testing.T) {
-	m := &model{feed: true, w: 80, h: 24} // narrow → stacked, feedMaxLines visible
+	m := &model{feed: true, w: 80, h: 24} // stacked feed; height fills the region
 	for range 20 {
 		m.appendEvent(Event{Label: "x", To: StateDone})
 	}
-	const visible = feedMaxLines
+	_, _, _, visible := m.feedLayout()
 
 	win, older, newer := m.feedWindow(visible)
 	if len(win) != visible || newer != 0 || older != 20-visible {
