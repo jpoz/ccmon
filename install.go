@@ -412,6 +412,7 @@ func deps() []dep {
 	return []dep{
 		{"terminal-notifier", "brew install terminal-notifier  (required for notifications)"},
 		{"tmux", "brew install tmux  (required for pane tracking + jumping)"},
+		{"gh", "brew install gh  (optional — powers the TUI's open-PRs panel)"},
 	}
 }
 

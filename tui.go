@@ -132,6 +132,11 @@ type model struct {
 	feedBottomSeq int64               // anchored bottom event when scrolled; 0 = follow tail
 	muted         bool                // notification sounds silenced (mirrors the ~/.ccmon/muted flag)
 	backend       string              // notification backend (mirrors ~/.ccmon/notify-backend)
+	prsOn         bool                // whether the open-PRs panel is shown (mirrors ~/.ccmon/prs-hidden)
+	prs           []prInfo            // open PRs authored by the gh user (see prs.go)
+	prsErr        string              // last fetch error, "" when healthy
+	prsAt         int64               // unix secs of last completed fetch; 0 = never
+	prsBusy       bool                // a fetch command is in flight
 }
 
 func (m model) Init() tea.Cmd { return tick() }
@@ -174,7 +179,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refresh()
 			m.checkNags()
 		}
+		if cmd := m.maybeFetchPRs(); cmd != nil {
+			return m, tea.Batch(tick(), cmd)
+		}
 		return m, tick()
+	case prsMsg:
+		m.prsBusy = false
+		m.prsAt = now()
+		if msg.err != nil {
+			m.prsErr = msg.err.Error() // keep the stale list; it beats a blank panel
+		} else {
+			m.prs, m.prsErr = msg.prs, ""
+		}
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -236,15 +252,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "f": // toggle the activity-feed panel
 			m.feed = !m.feed
 			m.feedBottomSeq = 0 // (re)open streaming live
+		case "p": // toggle the open-PRs panel
+			m.prsOn = !m.prsOn
+			_ = setPRsHidden(!m.prsOn)
+			if m.prsOn {
+				m.prsAt = 0 // fetch fresh on the next tick
+			}
 		case "pgup", "ctrl+u": // newest is at the top → scroll up toward the live tail
 			m.scrollFeed(1)
 		case "pgdown", "ctrl+d": // scroll down into older history
 			m.scrollFeed(-1)
 		case "r":
 			m.refresh()
+			m.prsAt = 0 // manual refresh re-fetches PRs too (next tick)
 		}
 	}
 	return m, nil
+}
+
+// maybeFetchPRs starts a background PR fetch when the panel is shown, nothing
+// is already in flight, and the last result has gone stale. Called from the
+// tick so a just-toggled-on panel (prsAt reset to 0) fetches within 125ms.
+func (m *model) maybeFetchPRs() tea.Cmd {
+	if !m.prsOn || m.prsBusy || (m.prsAt != 0 && now()-m.prsAt < prRefreshSecs()) {
+		return nil
+	}
+	m.prsBusy = true
+	return fetchPRs
 }
 
 // ---- styling (Nord palette, to match the user's ghostty/tmux theme) ----
@@ -314,8 +348,11 @@ func dur(since int64) string {
 		return fmt.Sprintf("%ds", d)
 	case d < 3600:
 		return fmt.Sprintf("%dm%02ds", d/60, d%60)
-	default:
+	case d < 86400:
 		return fmt.Sprintf("%dh%02dm", d/3600, (d%3600)/60)
+	default:
+		// Days keep week-old PRs inside the AGE column ("47d21h", not "1149h13m").
+		return fmt.Sprintf("%dd%02dh", d/86400, (d%86400)/3600)
 	}
 }
 
@@ -359,20 +396,23 @@ func (m model) viewStacked(termW, termH int) string {
 	indent := strings.Repeat(" ", max((termW-width)/2, 0))
 
 	// Region between the col-header and the footer (header, blank, col-header,
-	// footer = 4 fixed lines) is shared by the table and, when open, the feed.
+	// footer = 4 fixed lines) is shared by the table, the open-PRs panel (which
+	// sits directly under the sessions), and, when open, the feed.
 	region := max(termH-4, 1)
+	prH := m.prPanelHeight(max(region/2, 0))
 
-	var body, feedLines []string
+	var body, prLines, feedLines []string
 	if m.feed {
 		// The table takes only the rows it needs; the activity panel grows to
 		// fill the rest of the region (feedLayout computes the matching split so
 		// the scroll handler agrees on the visible window).
 		_, _, _, feedRows := m.feedLayout()
-		body = m.renderBody(width, max(region-feedRows-1, 1))
+		body = m.renderBody(width, max(region-prH-feedRows-1, 1))
 		feedLines = m.renderFeed(width, feedRows)
 	} else {
-		body = m.renderBody(width, region)
+		body = m.renderBody(width, max(region-prH, 1))
 	}
+	prLines = m.renderPRs(width, prH)
 
 	var b strings.Builder
 	b.WriteString(indent + m.headerBar(width) + "\n\n")
@@ -380,7 +420,10 @@ func (m model) viewStacked(termW, termH int) string {
 	for _, line := range body {
 		b.WriteString(indent + line + "\n")
 	}
-	if fill := region - len(body) - len(feedLines); fill > 0 {
+	for _, line := range prLines {
+		b.WriteString(indent + line + "\n")
+	}
+	if fill := region - len(body) - len(prLines) - len(feedLines); fill > 0 {
 		b.WriteString(strings.Repeat("\n", fill))
 	}
 	for _, line := range feedLines {
@@ -401,8 +444,11 @@ func (m model) viewSide(termW, tableW, feedW, feedRows int) string {
 	// so the table gets feedRows data rows just like the feed gets feedRows events.
 	regionH := feedRows + 1
 
-	// Left column: column header + table rows, padded to the region height.
-	left := append([]string{colHeadLine(tableW)}, m.renderBody(tableW, feedRows)...)
+	// Left column: column header + table rows + the open-PRs panel directly
+	// beneath the sessions, padded to the region height.
+	prH := m.prPanelHeight(max((feedRows+1)/2, 0))
+	left := append([]string{colHeadLine(tableW)}, m.renderBody(tableW, max(feedRows-prH, 1))...)
+	left = append(left, m.renderPRs(tableW, prH)...)
 	// Right column: the feed panel, filling the same height.
 	right := m.renderFeed(feedW, feedRows)
 
@@ -457,9 +503,9 @@ func (m model) footerBar(width int) string {
 	if m.backend == backendOSC777 {
 		backend = "n notifier"
 	}
-	keys := "↑/↓ move · enter jump · c ack · x forget · f feed · " + mute + " · " + backend + " · q quit"
+	keys := "↑/↓ move · enter jump · c ack · x forget · f feed · p prs · " + mute + " · " + backend + " · q quit"
 	if m.feed {
-		keys = "↑/↓ move · enter jump · c ack · f feed · scroll PgUp/PgDn · " + mute + " · " + backend + " · q quit"
+		keys = "↑/↓ move · enter jump · c ack · f feed · p prs · scroll PgUp/PgDn · " + mute + " · " + backend + " · q quit"
 	}
 	var footer string
 	if m.status != "" {
@@ -663,7 +709,8 @@ func padRight(s string, n int) string {
 
 func runTUI() {
 	rows := gather()
-	m := model{rows: rows, nag: map[string]int64{}, prev: seedSnaps(rows), muted: isMuted(), backend: notifyBackend()}
+	m := model{rows: rows, nag: map[string]int64{}, prev: seedSnaps(rows), muted: isMuted(),
+		backend: notifyBackend(), prsOn: !prsHidden()}
 	m.loadHistory()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, _ = p.Run()

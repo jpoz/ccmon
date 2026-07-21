@@ -139,14 +139,17 @@ func (m model) feedLayout() (side bool, tableW, feedW, rows int) {
 		// one of its rows is the panel's own title, leaving termH-4 for events.
 		return true, min(tableW, maxContentWidth), feedW, max(termH-4, 1)
 	}
-	// Stacked: the table takes only the rows it needs and the activity panel
-	// fills the rest of the region down to the footer (with a floor so it stays
-	// useful when the table is crowded). Region = termH minus header(1), blank(1),
-	// col-header(1), footer(1); the feed's own title rule takes one more line.
+	// Stacked: the table takes only the rows it needs, the open-PRs panel (when
+	// shown) sits beneath it, and the activity panel fills the rest of the region
+	// down to the footer (with a floor so it stays useful when the table is
+	// crowded). Region = termH minus header(1), blank(1), col-header(1),
+	// footer(1); the feed's own title rule takes one more line. The prH math here
+	// must match viewStacked's so both agree on the feed's visible window.
 	width := min(termW, maxContentWidth)
 	region := max(termH-4, 1)
-	bodyH := m.bodyLineCount(width, max(region-feedMinLines-1, 1))
-	return false, width, 0, max(region-bodyH-1, feedMinLines)
+	prH := m.prPanelHeight(max(region/2, 0))
+	bodyH := m.bodyLineCount(width, max(region-prH-feedMinLines-1, 1))
+	return false, width, 0, max(region-bodyH-prH-1, feedMinLines)
 }
 
 // idxOfSeq maps an event sequence number to its slice index. Seqs are contiguous

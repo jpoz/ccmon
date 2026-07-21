@@ -137,9 +137,9 @@ removes them — but for reference, the wiring is:
 ## TUI keys
 
 `↑/↓` or `j/k` move · `Enter` jump to pane · `c` acknowledge (clear alert) ·
-`x` forget instance · `f` toggle activity feed · `PgUp/PgDn` (or `Ctrl-U/Ctrl-D`)
-scroll the feed · `m` mute/unmute sounds · `n` switch notify backend ·
-`r` refresh · `q` quit
+`x` forget instance · `f` toggle activity feed · `p` toggle open-PRs panel ·
+`PgUp/PgDn` (or `Ctrl-U/Ctrl-D`) scroll the feed · `m` mute/unmute sounds ·
+`n` switch notify backend · `r` refresh · `q` quit
 
 ## Jumping to a pane (Ghostty splits)
 
@@ -243,6 +243,23 @@ log seeds silently so already-running sessions don't flood it. The only gap is
 events that happen with the TUI closed and no hook to catch them — a killed pane
 or a codex turn while you're away won't be in the history.
 
+## Open PRs panel
+
+Directly below the sessions table, an `── OPEN PRS` panel lists every open pull
+request you've authored across all repos — CI state as a glyph (`✓` passing,
+`✗` failing, spinner while checks run, `○` no checks), `repo#number`, time since
+last activity, and the review state (`approved` / `changes` / `review` /
+`draft`), then the title. Rows sort by what needs your hands first: failing CI,
+then changes requested, then approved-and-ready-to-merge, then the rest by
+recency; what doesn't fit folds into `… and N more`.
+
+Data comes from the `gh` CLI (one GraphQL search per refresh, every 60s while
+the panel is shown), so it requires `gh` installed and authenticated —
+`author:@me` is whoever `gh auth status` says you are. Fetches run in the
+background; a fetch error shows on the panel's rule and keeps the last good
+list. `p` hides/shows the panel, persisted in `~/.ccmon/prs-hidden` (a hidden
+panel costs zero API calls).
+
 ## Re-notifications (nagging)
 
 While the TUI is running it acts as the watcher: any session stuck in
@@ -260,6 +277,7 @@ the repeating reminders just need the TUI up (e.g. in a dashboard pane).
 | var               | default | effect                                              |
 |-------------------|---------|-----------------------------------------------------|
 | `CCMON_NAG_SECS`  | `60`    | seconds between re-notifications of a red session   |
+| `CCMON_PR_SECS`   | `60`    | seconds between refreshes of the open-PRs panel     |
 | `CCMON_FOCUS`     | `auto`  | terminal split-focus on jump: `auto` (focus the Ghostty sibling split only when ccmon is in Ghostty), `ghostty` (force it), `none`/`off` (tmux navigation only) |
 | `CCMON_DEBUG`     | unset   | append every notification to `~/.ccmon/notify.log`  |
 
