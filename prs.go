@@ -214,6 +214,53 @@ func (m model) prPanelHeight(maxLines int) int {
 	return min(1+max(len(m.prs), 1), 1+prMaxRows, maxLines)
 }
 
+// prShownCount is how many of n PRs fit in a panel `lines` tall (rule
+// included), reserving a line for "… and N more" when they don't all fit.
+// renderPRs and the cursor math share it so only rows that are actually on
+// screen are selectable.
+func prShownCount(n, lines int) int {
+	rows := lines - 1
+	if n <= rows {
+		return max(n, 0)
+	}
+	return max(rows-1, 0)
+}
+
+// currentPRHeight is the panel height the active layout will use — the single
+// source of truth for viewStacked, viewSide, and the cursor range. The stacked
+// arithmetic here must match feedLayout's (which can't call this: it would
+// recurse through the side-layout probe).
+func (m model) currentPRHeight() int {
+	if side, _, _, feedRows := m.feedLayout(); m.feed && side {
+		return m.prPanelHeight(max((feedRows+1)/2, 0))
+	}
+	termH := m.h
+	if termH == 0 {
+		termH = 24
+	}
+	region := max(termH-4, 1)
+	return m.prPanelHeight(max(region/2, 0))
+}
+
+// prSelectable is how many PR rows the cursor can reach right now.
+func (m model) prSelectable() int {
+	return prShownCount(len(m.prs), m.currentPRHeight())
+}
+
+// selectedPR resolves the cursor to a PR when it sits past the sessions.
+func (m model) selectedPR() (prInfo, bool) {
+	i := m.cur - len(m.rows)
+	if i < 0 || i >= m.prSelectable() {
+		return prInfo{}, false
+	}
+	return m.prs[i], true
+}
+
+// openURL opens a URL in the default browser. A var so tests can stub the exec.
+var openURL = func(url string) error {
+	return exec.Command("open", url).Start()
+}
+
 // renderPRs returns exactly `lines` lines (rule + rows, blank-padded) so the
 // layout never jumps as results arrive. Callers size `lines` via prPanelHeight.
 func (m model) renderPRs(width, lines int) []string {
@@ -233,7 +280,6 @@ func (m model) renderPRs(width, lines int) []string {
 	fill := max(width-lipgloss.Width(head)-lipgloss.Width(status), 0)
 	out := []string{fg(cDim, head+strings.Repeat("─", fill)) + fg(statusColor, status)}
 
-	rows := lines - 1
 	switch {
 	case len(m.prs) == 0 && m.prsAt == 0 && m.prsErr == "":
 		out = append(out, fg(cDim, "    fetching open PRs…"))
@@ -242,12 +288,9 @@ func (m model) renderPRs(width, lines int) []string {
 	case len(m.prs) == 0:
 		out = append(out, fg(cDim, "    no open PRs"))
 	default:
-		shown := len(m.prs)
-		if shown > rows {
-			shown = max(rows-1, 0) // reserve a line for "… and N more"
-		}
-		for _, p := range m.prs[:shown] {
-			out = append(out, m.renderPR(p, width))
+		shown := prShownCount(len(m.prs), lines)
+		for i, p := range m.prs[:shown] {
+			out = append(out, m.renderPR(p, width, m.cur-len(m.rows) == i))
 		}
 		if shown < len(m.prs) {
 			out = append(out, fg(cDim, fmt.Sprintf("    … and %d more", len(m.prs)-shown)))
@@ -261,8 +304,17 @@ func (m model) renderPRs(width, lines int) []string {
 
 // renderPR formats one PR: CI glyph, repo#num, age, review tag, title. In
 // narrow mode the tag column is dropped — the CI glyph is the load-bearing
-// signal and the title needs the room more.
-func (m model) renderPR(p prInfo, width int) string {
+// signal and the title needs the room more. The selected row gets the same
+// accent bar + highlight background as a selected session.
+func (m model) renderPR(p prInfo, width int, sel bool) string {
+	paint := func(c lipgloss.Color, bold bool, s string) string {
+		st := lipgloss.NewStyle().Foreground(c).Bold(bold)
+		if sel {
+			st = st.Background(cSelBg)
+		}
+		return st.Render(s)
+	}
+
 	glyph, gc := m.prCIGlyph(p.CI)
 	repo := padRight(truncate(fmt.Sprintf("%s#%d", p.Repo, p.Number), colPRRepo), colPRRepo)
 	age := padRight(dur(p.Updated), colAge)
@@ -271,12 +323,21 @@ func (m model) renderPR(p prInfo, width int) string {
 	tagPart, fixed := "", 2+2+colPRRepo+1+colAge+1
 	if !narrow {
 		tag, tc := prTag(p)
-		tagPart = fg(tc, padRight(tag, colPRTag)+" ")
+		tagPart = paint(tc, false, padRight(tag, colPRTag)+" ")
 		fixed += colPRTag + 1
 	}
 	title := truncate(p.Title, max(width-fixed-1, 8))
-	return "  " + fg(gc, glyph+" ") + fg(cFg, repo+" ") + fg(cDim, age+" ") +
-		tagPart + fg(cDim, title)
+
+	lead, titleColor := "  ", cDim
+	if sel {
+		lead, titleColor = paint(cAccent, false, "▌ "), cFg
+	}
+	line := lead + paint(gc, false, glyph+" ") + paint(cFg, sel, repo+" ") +
+		paint(cDim, false, age+" ") + tagPart + paint(titleColor, false, title)
+	if sel {
+		return padBg(line, width, cSelBg)
+	}
+	return line
 }
 
 // prCIGlyph maps a status rollup to the same visual language as the sessions

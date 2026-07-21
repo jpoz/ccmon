@@ -113,9 +113,7 @@ func (m *model) refresh() {
 		appendFeedLog(e) // persist what the TUI observes (incl. closes / codex inference)
 	}
 	m.rows = rows
-	if m.cur >= len(m.rows) {
-		m.cur = max(0, len(m.rows)-1)
-	}
+	m.clampCur()
 }
 
 // feedLayout decides, from the current terminal size, whether the feed should

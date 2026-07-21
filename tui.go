@@ -173,6 +173,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		m.clampCur() // a shrunk terminal can hide PR rows the cursor sat on
 	case tickMsg:
 		m.frame++
 		if m.frame%framesPerGather == 0 {
@@ -190,6 +191,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.prsErr = msg.err.Error() // keep the stale list; it beats a blank panel
 		} else {
 			m.prs, m.prsErr = msg.prs, ""
+			m.clampCur()
 		}
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -200,13 +202,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cur--
 			}
 		case "down", "j":
-			if m.cur < len(m.rows)-1 {
+			if m.cur < m.selectableCount()-1 {
 				m.cur++
 			}
 		case "g":
 			m.cur = 0
 		case "G":
-			m.cur = len(m.rows) - 1
+			m.cur = max(m.selectableCount()-1, 0)
 		case "enter":
 			if m.cur < len(m.rows) {
 				inst := m.rows[m.cur]
@@ -216,6 +218,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status = "→ " + label(inst)
 				}
 				m.refresh()
+			} else if p, ok := m.selectedPR(); ok {
+				if err := openURL(p.URL); err != nil {
+					m.status = "open failed: " + err.Error()
+				} else {
+					m.status = fmt.Sprintf("→ %s#%d ↗", p.Repo, p.Number)
+				}
 			}
 		case "c": // acknowledge: clear the alert + dismiss its banner
 			if m.cur < len(m.rows) {
@@ -257,6 +265,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_ = setPRsHidden(!m.prsOn)
 			if m.prsOn {
 				m.prsAt = 0 // fetch fresh on the next tick
+			} else {
+				m.clampCur() // cursor may have been on a PR row
 			}
 		case "pgup", "ctrl+u": // newest is at the top → scroll up toward the live tail
 			m.scrollFeed(1)
@@ -268,6 +278,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// selectableCount is the full cursor range: the session rows, then the PR rows
+// currently on screen (the cursor flows off the bottom of the table into the
+// open-PRs panel).
+func (m model) selectableCount() int { return len(m.rows) + m.prSelectable() }
+
+// clampCur pulls the cursor back into range after anything shrinks it — fewer
+// sessions, fewer PRs, the panel toggled off, or a resize hiding PR rows.
+func (m *model) clampCur() {
+	if last := m.selectableCount() - 1; m.cur > last {
+		m.cur = max(last, 0)
+	}
 }
 
 // maybeFetchPRs starts a background PR fetch when the panel is shown, nothing
@@ -399,7 +422,7 @@ func (m model) viewStacked(termW, termH int) string {
 	// footer = 4 fixed lines) is shared by the table, the open-PRs panel (which
 	// sits directly under the sessions), and, when open, the feed.
 	region := max(termH-4, 1)
-	prH := m.prPanelHeight(max(region/2, 0))
+	prH := m.currentPRHeight()
 
 	var body, prLines, feedLines []string
 	if m.feed {
@@ -446,7 +469,7 @@ func (m model) viewSide(termW, tableW, feedW, feedRows int) string {
 
 	// Left column: column header + table rows + the open-PRs panel directly
 	// beneath the sessions, padded to the region height.
-	prH := m.prPanelHeight(max((feedRows+1)/2, 0))
+	prH := m.currentPRHeight()
 	left := append([]string{colHeadLine(tableW)}, m.renderBody(tableW, max(feedRows-prH, 1))...)
 	left = append(left, m.renderPRs(tableW, prH)...)
 	// Right column: the feed panel, filling the same height.
@@ -503,9 +526,9 @@ func (m model) footerBar(width int) string {
 	if m.backend == backendOSC777 {
 		backend = "n notifier"
 	}
-	keys := "↑/↓ move · enter jump · c ack · x forget · f feed · p prs · " + mute + " · " + backend + " · q quit"
+	keys := "↑/↓ move · enter jump/open · c ack · x forget · f feed · p prs · " + mute + " · " + backend + " · q quit"
 	if m.feed {
-		keys = "↑/↓ move · enter jump · c ack · f feed · p prs · scroll PgUp/PgDn · " + mute + " · " + backend + " · q quit"
+		keys = "↑/↓ move · enter jump/open · c ack · f feed · p prs · scroll PgUp/PgDn · " + mute + " · " + backend + " · q quit"
 	}
 	var footer string
 	if m.status != "" {

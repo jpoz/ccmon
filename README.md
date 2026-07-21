@@ -136,10 +136,11 @@ removes them — but for reference, the wiring is:
 
 ## TUI keys
 
-`↑/↓` or `j/k` move · `Enter` jump to pane · `c` acknowledge (clear alert) ·
-`x` forget instance · `f` toggle activity feed · `p` toggle open-PRs panel ·
-`PgUp/PgDn` (or `Ctrl-U/Ctrl-D`) scroll the feed · `m` mute/unmute sounds ·
-`n` switch notify backend · `r` refresh · `q` quit
+`↑/↓` or `j/k` move (the cursor flows from the sessions into the PR rows) ·
+`Enter` jump to pane / open the selected PR in the browser · `c` acknowledge
+(clear alert) · `x` forget instance · `f` toggle activity feed · `p` toggle
+open-PRs panel · `PgUp/PgDn` (or `Ctrl-U/Ctrl-D`) scroll the feed ·
+`m` mute/unmute sounds · `n` switch notify backend · `r` refresh · `q` quit
 
 ## Jumping to a pane (Ghostty splits)
 
@@ -252,6 +253,10 @@ last activity, and the review state (`approved` / `changes` / `review` /
 `draft`), then the title. Rows sort by what needs your hands first: failing CI,
 then changes requested, then approved-and-ready-to-merge, then the rest by
 recency; what doesn't fit folds into `… and N more`.
+
+PR rows are **selectable**: `↓`/`j` walks the cursor off the bottom of the
+sessions table into the panel (`G` jumps straight to the end), and `Enter` on a
+PR opens it in your browser.
 
 Data comes from the `gh` CLI (one GraphQL search per refresh, every 60s while
 the panel is shown), so it requires `gh` installed and authenticated —

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // A trimmed real gh response: one PR with no CI and a null review decision,
@@ -112,6 +114,101 @@ func TestRenderPRsHeightAndOverflow(t *testing.T) {
 	lines = empty.renderPRs(80, 2)
 	if len(lines) != 2 || !strings.Contains(lines[1], "fetching") {
 		t.Errorf("never-fetched panel should show the fetching placeholder, got %q", lines)
+	}
+}
+
+func TestPRShownCount(t *testing.T) {
+	cases := []struct{ n, lines, want int }{
+		{0, 5, 0},  // nothing to show
+		{3, 4, 3},  // all fit exactly (rule + 3 rows)
+		{3, 10, 3}, // spare room doesn't invent rows
+		{6, 5, 3},  // 4 content rows, one reserved for "… and N more"
+		{6, 1, 0},  // rule only → nothing selectable
+		{6, 0, 0},  // no panel
+		{6, 2, 0},  // one content row but it must be the overflow line
+	}
+	for _, c := range cases {
+		if got := prShownCount(c.n, c.lines); got != c.want {
+			t.Errorf("prShownCount(%d, %d) = %d, want %d", c.n, c.lines, got, c.want)
+		}
+	}
+}
+
+// The cursor flows off the bottom of the sessions table into the PR rows:
+// j/down walks into the panel and stops at the last visible PR, G lands there
+// directly, enter opens the selected PR in the browser, and hiding the panel
+// pulls a stranded cursor back into range.
+func TestCursorFlowsIntoPRs(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // the p-toggle persists a flag file
+	key := func(s string) tea.KeyMsg {
+		if s == "enter" {
+			return tea.KeyMsg{Type: tea.KeyEnter}
+		}
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+	m := model{
+		w: 100, h: 30, prsOn: true,
+		rows: []*Instance{feedInst("a", "claude", "ccmon", StateWorking)},
+		prs: []prInfo{
+			{Repo: "arc", Number: 1, URL: "https://example.com/1", Updated: now()},
+			{Repo: "arc", Number: 2, URL: "https://example.com/2", Updated: now()},
+		},
+	}
+	if got := m.selectableCount(); got != 3 {
+		t.Fatalf("selectableCount = %d, want 3 (1 session + 2 PRs)", got)
+	}
+
+	step := func(s string) {
+		next, _ := m.Update(key(s))
+		m = next.(model)
+	}
+	step("j")
+	step("j")
+	step("j") // one past the end — must stick at the last PR
+	if m.cur != 2 {
+		t.Fatalf("cursor after walking down = %d, want 2 (last PR)", m.cur)
+	}
+	if p, ok := m.selectedPR(); !ok || p.Number != 2 {
+		t.Fatalf("selectedPR = %+v ok=%v, want arc#2", p, ok)
+	}
+
+	var opened string
+	orig := openURL
+	openURL = func(url string) error { opened = url; return nil }
+	defer func() { openURL = orig }()
+	step("enter")
+	if opened != "https://example.com/2" {
+		t.Fatalf("enter opened %q, want the selected PR's URL", opened)
+	}
+	if !strings.Contains(m.status, "arc#2") {
+		t.Fatalf("status = %q, should name the opened PR", m.status)
+	}
+
+	step("g")
+	step("G")
+	if m.cur != 2 {
+		t.Fatalf("G should land on the last PR, got %d", m.cur)
+	}
+	step("p") // hide the panel with the cursor on a PR row
+	if m.prsOn || m.cur != 0 {
+		t.Fatalf("after hiding panel: prsOn=%v cur=%d, want false/0", m.prsOn, m.cur)
+	}
+}
+
+// The selected PR row carries the accent bar so selection is visible.
+func TestRenderPRsSelection(t *testing.T) {
+	m := model{
+		prsOn: true,
+		cur:   1, // no sessions → cursor 1 = second PR
+		prs: []prInfo{
+			{Repo: "arc", Number: 1, Updated: now()},
+			{Repo: "arc", Number: 2, Updated: now()},
+		},
+	}
+	lines := m.renderPRs(80, 3)
+	if strings.Contains(lines[1], "▌") || !strings.Contains(lines[2], "▌") {
+		t.Fatalf("expected only the second PR row to carry the selection bar:\n%s",
+			strings.Join(lines, "\n"))
 	}
 }
 
